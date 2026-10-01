@@ -222,6 +222,8 @@ export interface NodeRecord {
   unblockCondition: string | null;
   recoveryEpoch: number;
   recoveryFingerprint: string | null;
+  /** Durable opt-in policy; meaningful on the initiative node. */
+  autoPrune: boolean;
   createdAt: string;
   updatedAt: string;
 }

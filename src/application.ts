@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Orchestrator, profileDimensions, providerFailure, runtimeCounters, type Submission } from "./executor.ts";
+import { Orchestrator, profileDimensions, providerFailure, runtimeCounters, type Submission, type SubmissionOptions } from "./executor.ts";
 import { Supervisor } from "./supervisor.ts";
 import { applyArchitectureExecutionPlan, parseArchitectureContract, parsePlan, PiAgentRuntime, defaultPlan, type AgentRuntime, type ArchitectureDraft } from "./runtime.ts";
 import { CustomProfileStore, loadModelCatalog, loadProfile, materializeCatalogProfiles, parseRoleProfileSelection, validateProfileManifest, type ProfileManifest, type RoleProfileSelection } from "./profiles.ts";
@@ -52,6 +52,7 @@ export interface ServiceOptions {
   autoStart?: boolean;
   enableRelease?: boolean;
   runtime?: AgentRuntime;
+  env?: NodeJS.ProcessEnv;
 }
 
 function normalizeProfile(profile: ProfileManifest, projectRoot: string): ProfileManifest {
@@ -80,6 +81,7 @@ export class ApplicationService {
   readonly toolchain: ToolchainManager;
   readonly autoStart: boolean;
   readonly gateCommand: string[];
+  readonly env: NodeJS.ProcessEnv;
   private gitWorkspace: GitWorkspace | null = null;
 
   private git(): GitWorkspace {
@@ -90,6 +92,7 @@ export class ApplicationService {
   constructor(options: ServiceOptions = {}) {
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
     this.projectRoot = resolve(options.projectRoot ?? PROJECT_ROOT);
+    this.env = options.env ?? process.env;
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     this.store = new Store(join(this.stateDir, "state.sqlite3"));
     this.toolchain = new ToolchainManager(this.stateDir);
@@ -109,7 +112,7 @@ export class ApplicationService {
     const duplicate = allProfiles.find((profile, index) => allProfiles.findIndex((candidate) => candidate.id === profile.id) !== index);
     if (duplicate) throw new Error(`duplicate profile id: ${duplicate.id}`);
     this.profiles = Object.fromEntries(allProfiles.map((profile) => [profile.id, profile]));
-    this.roleSelection = parseRoleProfileSelection(process.env);
+    this.roleSelection = parseRoleProfileSelection(this.env);
     for (const [role, profileId] of Object.entries(this.roleSelection)) {
       const profile = this.profiles[profileId];
       if (!profile) throw new Error(`role profile selection ${role} -> ${profileId}: profile not configured`);
@@ -120,7 +123,7 @@ export class ApplicationService {
       gateCommand: options.gateCommand ?? gateFromEnvironment(),
       profiles: this.profiles,
       enableRelease: options.enableRelease ?? false,
-      env: process.env,
+      env: this.env,
       roleSelection: this.roleSelection,
     });
     this.supervisor = new Supervisor(this.store, { profiles: this.profiles });
@@ -142,11 +145,14 @@ export class ApplicationService {
     return profile;
   }
 
-  async submit(repoPath: string, prompt: string, plan?: PlanSpec, suppliedArchitecture?: ArchitectureDraft): Promise<Submission> {
+  async submit(repoPath: string, prompt: string, plan?: PlanSpec, suppliedArchitecture?: ArchitectureDraft | SubmissionOptions, options?: SubmissionOptions): Promise<Submission> {
     const repo = resolve(repoPath);
+    const inlineOptions = suppliedArchitecture && "autoPrune" in suppliedArchitecture ? suppliedArchitecture as SubmissionOptions : undefined;
+    const submissionOptions = options ?? inlineOptions ?? {};
+    const resolvedAutoPrune = submissionOptions.autoPrune ?? /^(1|true|yes|on)$/i.test(this.env.LAO_AUTO_PRUNE ?? "");
     if (this.autoStart) await this.ensureToolchain();
     let effectivePlan = plan;
-    let architectureDraft: ArchitectureDraft | null = suppliedArchitecture ?? null;
+    let architectureDraft: ArchitectureDraft | null = inlineOptions ? null : suppliedArchitecture as ArchitectureDraft | undefined ?? null;
     let architectureRun: any = null;
     let planningRun: any = null;
     if (this.autoStart) {
@@ -253,7 +259,7 @@ export class ApplicationService {
       }
     }
     this.validatePlanProfiles(effectivePlan ?? defaultPlan(prompt) as PlanSpec);
-    const submission = this.orchestrator.submit(repo, prompt, effectivePlan ?? defaultPlan(prompt) as PlanSpec);
+    const submission = this.orchestrator.submit(repo, prompt, effectivePlan ?? defaultPlan(prompt) as PlanSpec, { autoPrune: resolvedAutoPrune });
     if (architectureDraft) {
       const architectProfile = this.roleProfile("architect");
       this.store.saveArchitectureContract({

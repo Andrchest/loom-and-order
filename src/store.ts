@@ -217,20 +217,48 @@ function rowToNode(row: any): NodeRecord {
     unblockCondition: row.unblock_condition ?? null,
     recoveryEpoch: Number(row.recovery_epoch ?? 0),
     recoveryFingerprint: row.recovery_fingerprint ?? null,
+    autoPrune: Boolean(row.auto_prune),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
+
+export interface GcEligibility {
+  eligible: boolean;
+  reason: string | null;
+}
+
+export interface GcLock {
+  initiativeId: string;
+  owner: string;
+  pid: number;
+  acquiredAt: string;
+}
 
 type SchemaMigration = { version: number; up: (db: any) => void };
 
-// Ordered migrations. The inline CREATE/ALTER block in the constructor already
-// establishes the v1 shape for both fresh and pre-versioning databases, so
-// 0 -> 1 only stamps the version. Later schema changes get new entries here.
+// Ordered migrations. The inline CREATE/ALTER block establishes the v1 shape
+// for fresh and pre-versioning databases. v2 adds durable automatic-GC policy
+// and the recovery-safe exclusive lock table.
 const SCHEMA_MIGRATIONS: SchemaMigration[] = [
   { version: 1, up: () => {} },
+  {
+    version: 2,
+    up: (db) => {
+      try { db.exec("ALTER TABLE nodes ADD COLUMN auto_prune INTEGER NOT NULL DEFAULT 0"); } catch { /* v2-shaped fresh databases already have it */ }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS gc_locks (
+          initiative_id TEXT PRIMARY KEY REFERENCES nodes(id),
+          owner TEXT NOT NULL,
+          pid INTEGER NOT NULL,
+          acquired_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS gc_locks_owner_idx ON gc_locks(owner);
+      `);
+    },
+  },
 ];
 
 export class Store {
@@ -278,6 +306,7 @@ export class Store {
         unblock_condition TEXT,
         recovery_epoch INTEGER NOT NULL DEFAULT 0,
         recovery_fingerprint TEXT,
+        auto_prune INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -410,6 +439,13 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS agent_sessions_agent_idx ON agent_sessions(agent_id, started_at);
       CREATE INDEX IF NOT EXISTS agent_sessions_node_idx ON agent_sessions(node_id, state);
+      CREATE TABLE IF NOT EXISTS gc_locks (
+        initiative_id TEXT PRIMARY KEY REFERENCES nodes(id),
+        owner TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        acquired_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS gc_locks_owner_idx ON gc_locks(owner);
     `);
     for (const column of [
       "architecture_alias TEXT",
@@ -419,6 +455,7 @@ export class Store {
       "unblock_condition TEXT",
       "recovery_epoch INTEGER NOT NULL DEFAULT 0",
       "recovery_fingerprint TEXT",
+      "auto_prune INTEGER NOT NULL DEFAULT 0",
     ]) {
       try { this.db.exec(`ALTER TABLE nodes ADD COLUMN ${column}`); } catch { /* existing databases already have the column */ }
     }
@@ -586,8 +623,9 @@ export class Store {
     plan: PlanSpec;
     repoPath: string;
     baseCommit: string;
-  }): { initiativeId: string; epicIds: string[] } {
-    const { plan, repoPath, baseCommit } = input;
+    autoPrune?: boolean;
+  }): { initiativeId: string; epicIds: string[]; autoPrune: boolean } {
+    const { plan, repoPath, baseCommit, autoPrune = false } = input;
     if (!plan.title.trim() || !plan.epics.length) throw new Error("plan needs a title and at least one epic");
     const explicitIds: string[] = [];
     for (const epic of plan.epics) {
@@ -615,6 +653,9 @@ export class Store {
         { repoPath, baseCommit },
         "draft",
       );
+      // Keep policy persistence in the same transaction as the plan DAG. A
+      // detached/resumed run therefore cannot lose the operator's choice.
+      this.db.prepare("UPDATE nodes SET auto_prune = ? WHERE id = ? AND level = 'initiative'").run(autoPrune ? 1 : 0, initiativeId);
       const epicIds: string[] = [];
       const allSpecs: Array<{ id: string; dependsOn: string[] }> = [{ id: initiativeId, dependsOn: [] }];
       for (const epic of plan.epics) {
@@ -635,8 +676,8 @@ export class Store {
       }
       assertAcyclic(allSpecs);
       this.refreshReadyInternal(initiativeId);
-      this.event(initiativeId, "plan_created", { title: plan.title, epicIds });
-      return { initiativeId, epicIds };
+      this.event(initiativeId, "plan_created", { title: plan.title, epicIds, autoPrune: Boolean(autoPrune) });
+      return { initiativeId, epicIds, autoPrune: Boolean(autoPrune) };
     });
   }
 
@@ -728,6 +769,98 @@ export class Store {
     return this.db.prepare("SELECT * FROM nodes WHERE level = 'initiative' ORDER BY created_at").all().map(rowToNode);
   }
 
+  getAutoPrune(initiativeId: string): boolean {
+    const row = this.db.prepare("SELECT auto_prune FROM nodes WHERE id = ? AND level = 'initiative'").get(initiativeId) as any;
+    if (!row) throw new Error(`unknown initiative ${initiativeId}`);
+    return Boolean(row.auto_prune);
+  }
+
+  setAutoPrune(initiativeId: string, enabled: boolean): void {
+    this.tx(() => {
+      const result = this.db.prepare("UPDATE nodes SET auto_prune = ?, updated_at = ? WHERE id = ? AND level = 'initiative'").run(enabled ? 1 : 0, now(), initiativeId);
+      if (!result.changes) throw new Error(`unknown initiative ${initiativeId}`);
+      this.event(initiativeId, "auto_prune_policy_changed", { enabled: Boolean(enabled) });
+    });
+  }
+
+  private processAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+
+  private gcEligibilityInternal(initiativeId: string, at: Date): GcEligibility {
+    const initiative = this.getNode(initiativeId);
+    if (!initiative || initiative.level !== "initiative") return { eligible: false, reason: "unknown_initiative" };
+    if (!initiative.autoPrune) return { eligible: false, reason: "auto_prune_disabled" };
+    if (!(initiative.status === "completed" || initiative.status === "blocked")) return { eligible: false, reason: "initiative_not_terminal" };
+    const nodes = this.listNodes(initiativeId);
+    const nonTerminal = nodes.find((node) => !["completed", "blocked", "failed"].includes(node.status));
+    if (nonTerminal) return { eligible: false, reason: `non_terminal_node:${nonTerminal.id}` };
+    const cutoff = at.toISOString();
+    const lease = nodes.find((node) => (node.leaseOwner || node.leaseUntil) && (!node.leaseUntil || node.leaseUntil > cutoff));
+    if (lease) return { eligible: false, reason: `active_node_lease:${lease.id}` };
+    const session = this.db.prepare("SELECT id FROM agent_sessions WHERE state = 'running' AND (initiative_id = ? OR node_id IN (SELECT id FROM nodes WHERE initiative_id = ?)) LIMIT 1").get(initiativeId, initiativeId) as any;
+    if (session) return { eligible: false, reason: `running_agent_session:${session.id}` };
+    const run = this.db.prepare("SELECT owner, pid FROM initiative_runs WHERE initiative_id = ? LIMIT 1").get(initiativeId) as any;
+    if (run && this.processAlive(Number(run.pid))) return { eligible: false, reason: "active_initiative_run" };
+    const lock = this.db.prepare("SELECT owner, pid FROM gc_locks WHERE initiative_id = ? LIMIT 1").get(initiativeId) as any;
+    if (lock && this.processAlive(Number(lock.pid))) return { eligible: false, reason: "gc_lock_conflict" };
+    return { eligible: true, reason: null };
+  }
+
+  checkGcEligibility(initiativeId: string, at = new Date()): GcEligibility {
+    return this.gcEligibilityInternal(initiativeId, at);
+  }
+
+  isGcEligible(initiativeId: string, at = new Date()): boolean {
+    return this.checkGcEligibility(initiativeId, at).eligible;
+  }
+
+  /**
+   * Atomically checks the terminal snapshot and claims the exclusive GC lock.
+   * Dead owners are reclaimable, which makes an interrupted sweep safe to
+   * resume without requiring a separate cleanup transaction.
+   */
+  acquireGcLock(initiativeId: string, owner: string, pid = process.pid): boolean {
+    return this.tx(() => {
+      const eligibility = this.gcEligibilityInternal(initiativeId, new Date());
+      if (!eligibility.eligible) return false;
+      const existing = this.db.prepare("SELECT owner, pid FROM gc_locks WHERE initiative_id = ?").get(initiativeId) as any;
+      if (existing) {
+        if (existing.owner === owner && Number(existing.pid) === pid) return true;
+        if (this.processAlive(Number(existing.pid))) return false;
+        this.db.prepare("DELETE FROM gc_locks WHERE initiative_id = ?").run(initiativeId);
+      }
+      const acquiredAt = now();
+      this.db.prepare("INSERT INTO gc_locks (initiative_id, owner, pid, acquired_at) VALUES (?, ?, ?, ?)").run(initiativeId, owner, pid, acquiredAt);
+      this.event(initiativeId, "gc_lock_acquired", { owner, pid });
+      return true;
+    });
+  }
+
+  tryAcquireGcLock(initiativeId: string, owner: string, pid = process.pid): boolean {
+    return this.acquireGcLock(initiativeId, owner, pid);
+  }
+
+  releaseGcLock(initiativeId: string, owner: string): boolean {
+    return this.tx(() => {
+      const result = this.db.prepare("DELETE FROM gc_locks WHERE initiative_id = ? AND owner = ?").run(initiativeId, owner);
+      if (!result.changes) return false;
+      this.event(initiativeId, "gc_lock_released", { owner });
+      return true;
+    });
+  }
+
+  getGcLock(initiativeId: string): GcLock | null {
+    const row = this.db.prepare("SELECT * FROM gc_locks WHERE initiative_id = ?").get(initiativeId) as any;
+    return row ? { initiativeId, owner: row.owner, pid: Number(row.pid), acquiredAt: row.acquired_at } : null;
+  }
+
   saveArchitectureContract(contract: ArchitectureContract, supersessionReason?: string): ArchitectureContractRecord {
     validateArchitectureContract(contract);
     const initiative = this.getNode(contract.initiativeId);
@@ -765,6 +898,8 @@ export class Store {
 
   acquireInitiativeRun(initiativeId: string, owner: string, pid = process.pid): void {
     this.tx(() => {
+      const gcLock = this.db.prepare("SELECT owner, pid FROM gc_locks WHERE initiative_id = ?").get(initiativeId) as any;
+      if (gcLock && this.processAlive(Number(gcLock.pid)) && gcLock.owner !== owner) throw new Error(`initiative has an active GC lock: ${initiativeId}`);
       const existing = this.db.prepare("SELECT owner, pid FROM initiative_runs WHERE initiative_id = ?").get(initiativeId) as any;
       if (existing) {
         let active = false;
