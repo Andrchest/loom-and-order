@@ -27,6 +27,8 @@ Commands:
   dashboard INITIATIVE_ID
   logs [NODE_ID] | logs INITIATIVE_ID --follow
   metrics INITIATIVE_ID [--prometheus] [--out FILE]
+  deliver INITIATIVE_ID
+  prune [INITIATIVE_ID] [--all] [--include-epics] [--dry-run]
   recover
   supervise [--follow]
   supervisor-status
@@ -62,7 +64,7 @@ function parseArgs(argv: string[]): { positionals: string[]; values: Record<stri
     const arg = argv[i];
     if (!arg.startsWith("--")) { positionals.push(arg); continue; }
     const key = arg.slice(2);
-    if (key === "no-start" || key === "json" || key === "help" || key === "prometheus" || key === "overwrite" || key === "enable-release" || key === "follow" || key === "watch" || key === "once") { booleans.add(key); values[key] = "true"; continue; }
+    if (key === "no-start" || key === "json" || key === "help" || key === "prometheus" || key === "overwrite" || key === "enable-release" || key === "follow" || key === "watch" || key === "once" || key === "all" || key === "include-epics" || key === "dry-run") { booleans.add(key); values[key] = "true"; continue; }
     const value = argv[++i];
     if (value === undefined) throw new Error(`missing value for --${key}`);
     values[key] = value;
@@ -172,6 +174,15 @@ async function main(): Promise<void> {
       case "resume": service.resume(args[0]); output({ ok: true }, machine); break;
       case "dashboard": await runDashboard(service, args[0]); break;
       case "logs": output(service.logs(args[0]), machine); break;
+      case "deliver": {
+        if (!args[0]) throw new Error("deliver requires an initiative ID");
+        output(await service.deliver(args[0]), machine);
+        break;
+      }
+      case "prune": {
+        output(service.prune({ initiativeId: args[0], all: parsed.booleans.has("all"), includeEpics: parsed.booleans.has("include-epics"), dryRun: parsed.booleans.has("dry-run") }), machine);
+        break;
+      }
       case "recover": output({ recovered: service.recover() }, machine); break;
       case "supervisor-status": output(service.supervisorStatus(), machine); break;
       case "toolchain": {

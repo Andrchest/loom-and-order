@@ -80,6 +80,10 @@ export class GitWorkspace {
     git(repoPath, ["update-ref", `refs/heads/${branch}`, commit]);
   }
 
+  branchHead(repoPath: string, branch: string): string {
+    return git(repoPath, ["rev-parse", `refs/heads/${branch}`]);
+  }
+
   createWorktree(repoPath: string, branch: string, path: string, baseRef: string): void {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     git(repoPath, ["worktree", "add", "-b", branch, path, baseRef]);

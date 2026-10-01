@@ -983,6 +983,12 @@ export class Store {
     });
   }
 
+  /** Forget a node's worktree (used by `prune` after the directory is removed). */
+  clearWorktree(id: string): void {
+    this.db.prepare("UPDATE nodes SET worktree_path = NULL, updated_at = ? WHERE id = ?").run(now(), id);
+    this.event(id, "worktree_pruned", {});
+  }
+
   setWorktree(id: string, branch: string, worktreePath: string, baseCommit?: string): void {
     if (baseCommit) {
       this.db.prepare("UPDATE nodes SET branch = ?, worktree_path = ?, base_commit = ?, updated_at = ? WHERE id = ?").run(branch, worktreePath, baseCommit, now(), id);

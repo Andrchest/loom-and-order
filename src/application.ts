@@ -9,6 +9,7 @@ import { applyArchitectureExecutionPlan, parseArchitectureContract, parsePlan, P
 import { CustomProfileStore, loadModelCatalog, loadProfile, materializeCatalogProfiles, parseRoleProfileSelection, validateProfileManifest, type ProfileManifest, type RoleProfileSelection } from "./profiles.ts";
 import { prometheus } from "./metrics.ts";
 import { Store } from "./store.ts";
+import { GitWorkspace } from "./git.ts";
 import { ToolchainManager, type ToolchainStatus } from "./toolchain.ts";
 import type { AgentRecord, ArchitectureContract, EventRecord, PlanSpec } from "./domain.ts";
 
@@ -28,6 +29,20 @@ function gateFromEnvironment(): string[] {
   } catch (error) {
     throw new Error(`LAO_GATE_COMMAND must be a JSON string array: ${String(error)}`);
   }
+}
+
+function topologicalOrder(nodes: Array<{ id: string; dependsOn: string[] }>): string[] {
+  const remaining = new Map(nodes.map((node) => [node.id, new Set(node.dependsOn)]));
+  const ordered: string[] = [];
+  while (remaining.size) {
+    const ready = [...remaining.entries()].filter(([, deps]) => [...deps].every((dependency) => !remaining.has(dependency))).map(([id]) => id);
+    if (!ready.length) throw new Error("dependency cycle in epic graph; refusing to deliver");
+    for (const id of ready) {
+      ordered.push(id);
+      remaining.delete(id);
+    }
+  }
+  return ordered;
 }
 
 export interface ServiceOptions {
@@ -64,6 +79,13 @@ export class ApplicationService {
   readonly customProfileStore: CustomProfileStore;
   readonly toolchain: ToolchainManager;
   readonly autoStart: boolean;
+  readonly gateCommand: string[];
+  private gitWorkspace: GitWorkspace | null = null;
+
+  private git(): GitWorkspace {
+    if (!this.gitWorkspace) this.gitWorkspace = new GitWorkspace(this.stateDir);
+    return this.gitWorkspace;
+  }
 
   constructor(options: ServiceOptions = {}) {
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
@@ -103,6 +125,7 @@ export class ApplicationService {
     });
     this.supervisor = new Supervisor(this.store, { profiles: this.profiles });
     this.autoStart = options.autoStart ?? true;
+    this.gateCommand = options.gateCommand ?? gateFromEnvironment();
   }
 
   // External role -> profile selection: the operator's choice wins over the
@@ -484,6 +507,115 @@ export class ApplicationService {
       if (node) this.store.recordMetric({ initiativeId: node.initiativeId, nodeId, runId: `recovery-${nodeId}-${Date.now()}`, role: "scheduler", outcome: "recovery", durationMs: 0, dimensions: { status: "supervisor_recovery" } });
     }
     return report.recovered;
+  }
+
+  /**
+   * Deliver a completed initiative to the target repository without touching
+   * the operator's working tree: a throwaway worktree carries a
+   * `loom-and-order/deliver-<initiative>` branch that merges every completed
+   * epic branch (in dependency order) on top of the target's current HEAD,
+   * then passes the repository gate. Re-running rebuilds the branch from
+   * scratch (idempotent). The operator reviews and merges the branch
+   * themselves.
+   */
+  async deliver(initiativeId: string): Promise<any> {
+    const initiative = this.store.getNode(initiativeId);
+    if (!initiative) throw new Error(`unknown initiative: ${initiativeId}`);
+    if (initiative.status !== "completed") throw new Error(`initiative is ${initiative.status}; deliver requires a completed initiative`);
+    const git = this.git();
+    const repoPath = initiative.repoPath!;
+    git.assertRepository(repoPath);
+    const epics = this.store.listNodes(initiativeId).filter((node) => node.level === "epic");
+    const missing = epics.filter((epic) => epic.status !== "completed" || !epic.branch);
+    if (missing.length) throw new Error(`cannot deliver: epic(s) without completed branch: ${missing.map((epic) => epic.id).join(", ")}`);
+    const ordered = topologicalOrder(epics.map((epic) => ({ id: epic.id, dependsOn: epic.dependsOn })));
+    const branch = `loom-and-order/deliver-${initiativeId}`;
+    const worktree = join(this.stateDir, "worktrees", initiativeId, "deliver");
+    const base = git.head(repoPath);
+    // Idempotent rebuild: remove any previous deliver attempt.
+    if (git.branchExists(repoPath, branch)) {
+      try { git.removeWorktree(repoPath, worktree); } catch { /* already gone */ }
+      git.deleteBranch(repoPath, branch);
+    }
+    git.createWorktree(repoPath, branch, worktree, base);
+    git.ensureDependencies(worktree);
+    const merges: Array<{ epicId: string; branch: string; mergeCommit: string }> = [];
+    try {
+      for (const epicId of ordered) {
+        const epic = this.store.getNode(epicId)!;
+        merges.push({ epicId, branch: epic.branch!, mergeCommit: git.merge(worktree, epic.branch!) });
+      }
+    } catch (error) {
+      git.removeWorktree(repoPath, worktree);
+      this.store.recordEvent(initiativeId, "deliver_failed", { branch, reason: String(error) });
+      throw new Error(`deliver merge failed: ${String(error)}`);
+    }
+    const gate = await git.runGate(worktree, this.gateCommand);
+    git.removeWorktree(repoPath, worktree);
+    if (!gate.ok) {
+      this.store.recordEvent(initiativeId, "deliver_failed", { branch, reason: "repository gate failed on the delivered tree" });
+      throw new Error(`deliver gate failed on the delivered tree (branch ${branch} kept for inspection): ${gate.output.slice(-2000)}`);
+    }
+    const deliverHead = git.branchHead(repoPath, branch);
+    this.store.recordEvent(initiativeId, "deliver_completed", { branch, commit: deliverHead, base, epics: merges, gate: { ok: true, durationMs: gate.durationMs } });
+    return { branch, commit: deliverHead, base, epics: merges, gate: { ok: true, output: gate.output.slice(-4000), durationMs: gate.durationMs }, next: `git merge ${branch}` };
+  }
+
+  /**
+   * Garbage-collect worktrees of terminal nodes. Task/subtask worktrees are
+   * removed when their node is completed or failed; merged task branches are
+   * deleted, unmerged ones are kept for forensics. Epic worktrees are only
+   * removed with `includeEpics` and only for completed epics (their branches
+   * are always kept: `deliver` needs them). Dry-run reports without acting.
+   */
+  prune(options: { initiativeId?: string; all?: boolean; includeEpics?: boolean; dryRun?: boolean } = {}): any {
+    if (!options.initiativeId && !options.all) throw new Error("prune requires an initiative id or --all");
+    const git = this.git();
+    const initiatives = options.all
+      ? this.store.listInitiatives()
+      : [this.store.getNode(options.initiativeId!)].filter((node): node is NonNullable<typeof node> => Boolean(node));
+    if (!initiatives.length) throw new Error(`unknown initiative: ${options.initiativeId ?? ""}`);
+    const report: Array<{ nodeId: string; level: string; status: string; action: string; detail: string }> = [];
+    for (const initiative of initiatives) {
+      const nodes = this.store.listNodes(initiative.id);
+      const work = nodes.filter((node) => ["task", "subtask"].includes(node.level));
+      for (const node of work) {
+        if (!["completed", "failed"].includes(node.status)) {
+          if (node.worktreePath) report.push({ nodeId: node.id, level: node.level, status: node.status, action: "skipped", detail: "node is not terminal" });
+          continue;
+        }
+        if (!node.worktreePath && !node.branch) continue;
+        const merged = node.branch ? git.isAncestor(this.store.getNode(node.parentId ?? node.id)!.worktreePath ?? initiative.repoPath!, node.branch) : false;
+        const actions: string[] = [];
+        if (node.worktreePath) {
+          if (!options.dryRun) {
+            try { git.removeWorktree(initiative.repoPath!, node.worktreePath); } catch (error) { throw new Error(`worktree removal failed for ${node.id}: ${String(error)}`); }
+            this.store.clearWorktree(node.id);
+          }
+          actions.push("worktree removed");
+        }
+        if (node.branch) {
+          if (merged) {
+            if (!options.dryRun) git.deleteBranch(initiative.repoPath!, node.branch);
+            actions.push(`branch deleted (merged into parent: ${node.branch})`);
+          } else {
+            report.push({ nodeId: node.id, level: node.level, status: node.status, action: "branch-kept", detail: `unmerged branch ${node.branch} kept for forensics` });
+          }
+        }
+        if (actions.length) report.push({ nodeId: node.id, level: node.level, status: node.status, action: options.dryRun ? "would-prune" : "pruned", detail: actions.join("; ") });
+      }
+      if (options.includeEpics) {
+        for (const epic of nodes.filter((node) => node.level === "epic")) {
+          if (epic.status !== "completed" || !epic.worktreePath) continue;
+          if (!options.dryRun) {
+            git.removeWorktree(initiative.repoPath!, epic.worktreePath);
+            this.store.clearWorktree(epic.id);
+          }
+          report.push({ nodeId: epic.id, level: epic.level, status: epic.status, action: options.dryRun ? "would-prune" : "pruned", detail: `epic worktree removed; branch ${epic.branch} kept for deliver` });
+        }
+      }
+    }
+    return { dryRun: options.dryRun ?? false, actions: report };
   }
 
   logs(nodeId?: string): any[] {

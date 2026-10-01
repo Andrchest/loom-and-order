@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { ApplicationService, detachedRunInvocation } from "../src/application.ts";
+import { GitWorkspace } from "../src/git.ts";
 import { seedTestProfiles } from "./profile-fixtures.ts";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
@@ -529,6 +530,113 @@ test("MCP exposes the same durable application operations", () => {
     assert.deepEqual(JSON.parse(responses[11].result.content[0].text), []);
     assert.equal(responses[12].result.tools.some((tool: any) => tool.name === "architecture_contract_get"), true);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function completeNode(store: any, id: string): void {
+  store.transition(id, "leased");
+  store.transition(id, "running");
+  store.transition(id, "completed");
+}
+
+test("deliver merges completed epics into a deliver branch and prune cleans terminal worktrees", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "loom-and-order-deliver-"));
+  const target = repo(dir);
+  const state = join(dir, "state");
+  seedTestProfiles(state);
+  const service = new ApplicationService({ stateDir: state, autoStart: false, gateCommand: ["node", "-e", "process.exit(0)"] });
+  try {
+    const plan = { title: "Deliverable", epics: [
+      { id: "epic-a", title: "A", tasks: [{ id: "task-a", title: "T", acceptanceCriteria: ["ok"] }] },
+      { id: "epic-b", title: "B", dependsOn: ["epic-a"], tasks: [{ id: "task-b", title: "T2", acceptanceCriteria: ["ok"] }] },
+    ] } as any;
+    const submitted = service.orchestrator.submit(target, "Deliver", plan);
+    const git = new GitWorkspace(state);
+    const branch = (id: string) => `loom-and-order/${submitted.initiativeId}/${id}`;
+    // Simulate the executor's integration work for both epics.
+    const epicA = service.store.getNode("epic-a")!;
+    git.createWorktree(target, branch("epic-epic-a"), git.worktreePath(submitted.initiativeId, "epic-a"), epicA.baseCommit!);
+    writeFileSync(join(git.worktreePath(submitted.initiativeId, "epic-a"), "a.txt"), "a\n");
+    git.commitChanges(git.worktreePath(submitted.initiativeId, "epic-a"), "epic-a base work");
+    service.store.setWorktree("epic-a", branch("epic-epic-a"), git.worktreePath(submitted.initiativeId, "epic-a"));
+    const taskA = service.store.getNode("task-a")!;
+    git.createWorktree(target, branch("task-task-a"), git.worktreePath(submitted.initiativeId, "task-a"), git.currentCommit(git.worktreePath(submitted.initiativeId, "epic-a")));
+    writeFileSync(join(git.worktreePath(submitted.initiativeId, "task-a"), "task-a.txt"), "task a\n");
+    const taskACheck = git.commitChanges(git.worktreePath(submitted.initiativeId, "task-a"), "task-a: add work");
+    service.store.setWorktree("task-a", branch("task-task-a"), git.worktreePath(submitted.initiativeId, "task-a"));
+    const mergeA = git.merge(git.worktreePath(submitted.initiativeId, "epic-a"), branch("task-task-a"));
+    service.store.setIntegratedCommit("task-a", mergeA);
+    completeNode(service.store, "task-a");
+    const epicB = service.store.getNode("epic-b")!;
+    git.createWorktree(target, branch("epic-epic-b"), git.worktreePath(submitted.initiativeId, "epic-b"), epicB.baseCommit!);
+    git.merge(git.worktreePath(submitted.initiativeId, "epic-b"), branch("epic-epic-a"));
+    writeFileSync(join(git.worktreePath(submitted.initiativeId, "epic-b"), "b.txt"), "b\n");
+    git.commitChanges(git.worktreePath(submitted.initiativeId, "epic-b"), "epic-b base work");
+    service.store.setWorktree("epic-b", branch("epic-epic-b"), git.worktreePath(submitted.initiativeId, "epic-b"));
+    git.createWorktree(target, branch("task-task-b"), git.worktreePath(submitted.initiativeId, "task-b"), git.currentCommit(git.worktreePath(submitted.initiativeId, "epic-b")));
+    writeFileSync(join(git.worktreePath(submitted.initiativeId, "task-b"), "task-b.txt"), "task b\n");
+    git.commitChanges(git.worktreePath(submitted.initiativeId, "task-b"), "task-b: add work");
+    service.store.setWorktree("task-b", branch("task-task-b"), git.worktreePath(submitted.initiativeId, "task-b"));
+    const mergeB = git.merge(git.worktreePath(submitted.initiativeId, "epic-b"), branch("task-task-b"));
+    service.store.setIntegratedCommit("task-b", mergeB);
+    completeNode(service.store, "task-b");
+    service.store.refreshRollups(submitted.initiativeId);
+    assert.equal(service.store.getNode(submitted.initiativeId)!.status, "completed");
+
+    // Dry-run prune reports without acting.
+    const dry = service.prune({ initiativeId: submitted.initiativeId, dryRun: true });
+    assert.equal(dry.dryRun, true);
+    assert.equal(dry.actions.some((action: any) => action.action === "would-prune"), true);
+    assert.ok(existsSync(git.worktreePath(submitted.initiativeId, "task-a")));
+
+    // Deliver: branch built from target HEAD, both epics merged, gate passed.
+    const base = git.head(target);
+    const delivered = await service.deliver(submitted.initiativeId);
+    assert.equal(delivered.branch, `loom-and-order/deliver-${submitted.initiativeId}`);
+    assert.equal(delivered.base, base);
+    assert.equal(delivered.epics.length, 2);
+    assert.equal(delivered.epics[0].epicId, "epic-a");
+    assert.equal(delivered.epics[1].epicId, "epic-b");
+    assert.equal(git.isAncestor(target, taskACheck, `refs/heads/${delivered.branch}`), true);
+    assert.equal(git.isAncestor(target, mergeB, `refs/heads/${delivered.branch}`), true);
+    assert.equal(existsSync(join(state, "worktrees", submitted.initiativeId, "deliver")), false);
+    // Target working tree untouched: no deliver files, no deliver branch checkout.
+    assert.equal(execFileSync("git", ["-C", target, "branch", "--show-current"], { encoding: "utf8" }).trim(), "main");
+    assert.equal(existsSync(join(target, "task-a.txt")), false);
+
+    // Idempotent rebuild: a new target commit, re-deliver, branch follows it.
+    writeFileSync(join(target, "new.txt"), "new\n");
+    execFileSync("git", ["-C", target, "add", "."]);
+    execFileSync("git", ["-C", target, "commit", "-m", "new base work"]);
+    const redelivered = await service.deliver(submitted.initiativeId);
+    assert.equal(redelivered.base, git.head(target));
+    assert.equal(git.isAncestor(target, redelivered.base, `refs/heads/${redelivered.branch}`), true);
+
+    // Real prune removes terminal task worktrees and merged branches, keeps epics.
+    const pruned = service.prune({ initiativeId: submitted.initiativeId });
+    assert.equal(pruned.actions.filter((action: any) => action.action === "pruned" && action.level === "task").length, 2);
+    assert.equal(existsSync(git.worktreePath(submitted.initiativeId, "task-a")), false);
+    assert.equal(git.branchExists(target, branch("task-task-a")), false);
+    assert.equal(git.branchExists(target, branch("task-task-b")), false);
+    assert.ok(existsSync(git.worktreePath(submitted.initiativeId, "epic-a")));
+    assert.ok(git.branchExists(target, branch("epic-epic-a")));
+    assert.equal(service.store.getNode("task-a")!.worktreePath, null);
+
+    // --include-epics removes completed epic worktrees but keeps their branches.
+    const epicPruned = service.prune({ initiativeId: submitted.initiativeId, includeEpics: true });
+    assert.equal(epicPruned.actions.some((action: any) => action.nodeId === "epic-a" && action.action === "pruned"), true);
+    assert.equal(existsSync(git.worktreePath(submitted.initiativeId, "epic-a")), false);
+    assert.ok(git.branchExists(target, branch("epic-epic-a")));
+
+    // Deliver on a non-completed initiative fails closed.
+    const pending = service.orchestrator.submit(target, "Pending", { title: "P", epics: [{ id: "epic-p", title: "P", tasks: [{ id: "task-p", title: "T", acceptanceCriteria: ["ok"] }] }] } as any);
+    await assert.rejects(() => service.deliver(pending.initiativeId), /requires a completed initiative/);
+
+    // Prune without a scope fails.
+    assert.throws(() => service.prune({}), /initiative id or --all/);
+  } finally {
+    service.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
