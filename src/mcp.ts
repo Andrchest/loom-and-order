@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import type { ApplicationService } from "./application.ts";
 
 const TOOLS = [
-  { name: "submit", description: "Create and start a durable initiative", inputSchema: { type: "object", required: ["repo", "prompt"], properties: { repo: { type: "string" }, prompt: { type: "string" } } } },
+  { name: "submit", description: "Create and start a durable initiative", inputSchema: { type: "object", required: ["repo", "prompt"], properties: { repo: { type: "string" }, prompt: { type: "string" }, autoPrune: { type: "boolean", description: "Opt in to automatic task/subtask cleanup; defaults to LAO_AUTO_PRUNE or off" } } } },
   { name: "tree", description: "Read an initiative task tree", inputSchema: { type: "object", required: ["initiativeId"], properties: { initiativeId: { type: "string" } } } },
   { name: "status", description: "Read one node or concise initiative progress", inputSchema: { type: "object", required: ["nodeId"], properties: { nodeId: { type: "string" } } } },
   { name: "progress", description: "Read concise SQLite-backed initiative progress without agent calls", inputSchema: { type: "object", required: ["initiativeId"], properties: { initiativeId: { type: "string" } } } },
@@ -95,7 +95,11 @@ export async function serveMcp(service: ApplicationService): Promise<void> {
 
 async function callTool(service: ApplicationService, name: string, args: any): Promise<any> {
   switch (name) {
-    case "submit": return result(await service.submit(args.repo, args.prompt));
+    case "submit": {
+      if (args.autoPrune !== undefined && typeof args.autoPrune !== "boolean") throw new Error("submit autoPrune must be a boolean");
+      const options = args.autoPrune === undefined ? undefined : { autoPrune: args.autoPrune };
+      return result(await service.submit(args.repo, args.prompt, undefined, undefined, options));
+    }
     case "tree": return result(service.tree(args.initiativeId));
     case "status": return result(service.status(args.nodeId));
     case "progress": return result(service.progress(args.initiativeId));

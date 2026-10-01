@@ -25,11 +25,53 @@ function repo(parent: string): string {
   return path;
 }
 
-function runCli(args: string[]): any {
-  const result = spawnSync(process.execPath, ["--experimental-strip-types", cli, ...args], { encoding: "utf8" });
+function runCli(args: string[], env: NodeJS.ProcessEnv = process.env): any {
+  const result = spawnSync(process.execPath, ["--experimental-strip-types", cli, ...args], { encoding: "utf8", env });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }
+
+test("resolves and persists per-submission automatic GC policy", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "loom-and-order-submit-policy-"));
+  const target = repo(dir);
+  const state = join(dir, "state");
+  const service = new ApplicationService({ stateDir: state, autoStart: false, env: { ...process.env, LAO_AUTO_PRUNE: "true" } });
+  try {
+    const plan = { title: "Policy", epics: [{ title: "Core", tasks: [{ title: "Task" }] }] };
+    const fromEnv = await service.submit(target, "env", plan);
+    const explicitOff = await service.submit(target, "off", { ...plan, title: "Off", epics: [{ title: "Core", tasks: [{ title: "Task 2" }] }] }, { autoPrune: false });
+    assert.equal(service.store.getAutoPrune(fromEnv.initiativeId), true);
+    assert.equal(service.store.getAutoPrune(explicitOff.initiativeId), false);
+  } finally {
+    service.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI submit exposes automatic GC opt-in and keeps the default off", () => {
+  const dir = mkdtempSync(join(tmpdir(), "loom-and-order-cli-auto-prune-"));
+  const target = repo(dir);
+  const plan = join(dir, "plan.json");
+  writeFileSync(plan, JSON.stringify({ title: "Policy", epics: [{ title: "Core", tasks: [{ title: "Task" }] }] }));
+  try {
+    const enabledState = join(dir, "enabled-state");
+    const enabled = runCli(["submit", "--repo", target, "--prompt", "enabled", "--plan-file", plan, "--auto-prune", "--no-start", "--state-dir", enabledState, "--json"], { ...process.env, LAO_AUTO_PRUNE: "false" });
+    const enabledStore = new ApplicationService({ stateDir: enabledState, autoStart: false });
+    try { assert.equal(enabledStore.store.getAutoPrune(enabled.initiativeId), true); } finally { enabledStore.close(); }
+
+    for (const [value, expected] of [["false", false], ["maybe", false], [undefined, false], ["true", true]] as const) {
+      const state = join(dir, `env-${value ?? "absent"}`);
+      const env = { ...process.env };
+      if (value === undefined) delete env.LAO_AUTO_PRUNE;
+      else env.LAO_AUTO_PRUNE = value;
+      const submitted = runCli(["submit", "--repo", target, "--prompt", `env-${value ?? "absent"}`, "--plan-file", plan, "--no-start", "--state-dir", state, "--json"], env);
+      const persisted = new ApplicationService({ stateDir: state, autoStart: false });
+      try { assert.equal(persisted.store.getAutoPrune(submitted.initiativeId), expected, `LAO_AUTO_PRUNE=${value}`); } finally { persisted.close(); }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("builds an absolute detached runtime invocation with the state directory", () => {
   const invocation = detachedRunInvocation("/absolute/src/cli.ts", "initiative-test", "/tmp/loom-and-order-state");
