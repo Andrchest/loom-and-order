@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "defaultPreset": "none",
+  "limits": {
+    "codexNonManager": 4,
+    "local": 1,
+    "infrastructureRetries": 2
+  },
+  "pools": [
+    {
+      "id": "local",
+      "pool": "local",
+      "provider": "llama",
+      "model": "llama/example-local-model",
+      "name": "Local model pool (example)",
+      "contextWindow": 131072,
+      "thinkingLevels": ["low", "medium", "high", "xhigh"]
+    },
+    {
+      "id": "codex",
+      "pool": "codex",
+      "provider": "openai-codex",
+      "model": "openai-codex/gpt-5.5",
+      "name": "Codex pool (example)",
+      "contextWindow": 278528,
+      "thinkingLevels": ["low", "medium", "high", "xhigh", "max"]
+    }
+  ],
+  "models": [],
+  "profiles": [],
+  "presets": {}
+}

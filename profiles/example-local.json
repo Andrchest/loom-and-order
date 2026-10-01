@@ -1,0 +1,26 @@
+{
+  "id": "example-local",
+  "role": "worker",
+  "pool": "local",
+  "piBin": "${LAO_TOOLCHAIN_DIR}/node_modules/.bin/pi",
+  "model": null,
+  "thinkingLevel": "high",
+  "skills": ["./profiles/skills/worker"],
+  "extensions": [
+    "${LAO_TOOLCHAIN_DIR}/node_modules/pi-quiet-tools/src/index.ts",
+    "${LAO_TOOLCHAIN_DIR}/node_modules/@pedro_klein/pi-auto-retry/src/index.ts",
+    "${LAO_TOOLCHAIN_DIR}/node_modules/pi-mcp-adapter/index.ts",
+    "${LAO_TOOLCHAIN_DIR}/node_modules/@romansix/pi-tmux/extensions"
+  ],
+  "tools": ["read", "bash", "grep", "find", "ls", "write", "edit"],
+  "timeoutMs": 1800000,
+  "maxAttempts": 3,
+  "maxConcurrency": 1,
+  "sandbox": {
+    "backend": "trusted-local",
+    "sandboxName": null,
+    "allowedDomains": ["localhost:8080"],
+    "deniedDomains": [],
+    "credentialMode": "host-auth"
+  }
+}

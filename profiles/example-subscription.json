@@ -1,0 +1,25 @@
+{
+  "id": "example-subscription",
+  "role": "worker",
+  "pool": "codex",
+  "piBin": "${LAO_TOOLCHAIN_DIR}/node_modules/.bin/pi",
+  "model": "openai-codex/gpt-5.5",
+  "thinkingLevel": "high",
+  "skills": ["./profiles/skills/worker"],
+  "extensions": [
+    "${LAO_TOOLCHAIN_DIR}/node_modules/pi-quiet-tools/src/index.ts",
+    "${LAO_TOOLCHAIN_DIR}/node_modules/@pedro_klein/pi-auto-retry/src/index.ts",
+    "${LAO_TOOLCHAIN_DIR}/node_modules/pi-mcp-adapter/index.ts",
+    "${LAO_TOOLCHAIN_DIR}/node_modules/@romansix/pi-tmux/extensions"
+  ],
+  "tools": ["read", "bash", "grep", "find", "ls", "write", "edit"],
+  "timeoutMs": 5400000,
+  "maxAttempts": 3,
+  "sandbox": {
+    "backend": "trusted-local",
+    "sandboxName": null,
+    "allowedDomains": ["api.openai.com:443", "chatgpt.com:443", "github.com:443"],
+    "deniedDomains": [],
+    "credentialMode": "host-auth"
+  }
+}
