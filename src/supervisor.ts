@@ -5,6 +5,8 @@ export interface SupervisorOptions {
   profiles: Record<string, ProfileManifest>;
   intervalMs?: number;
   staleHeartbeatMs?: number;
+  /** Called after a complete recovery/rollup cycle, outside all node leases. */
+  onCycle?: () => void;
 }
 
 export interface SupervisorReport {
@@ -61,6 +63,7 @@ export class Supervisor {
     for (const initiativeId of report.refreshedInitiatives) {
       this.store.recordEvent(initiativeId, "supervisor_cycle", { recovered: report.recovered.length, blocked: report.blocked.length, staleSessions: report.staleSessions.length });
     }
+    try { this.options.onCycle?.(); } catch { /* automatic GC is a best-effort scheduler side effect */ }
     report.cursor = this.store.eventCursor();
     this.lastReport = report;
     return report;
