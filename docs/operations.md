@@ -47,7 +47,7 @@ ready → claim (lease) → worker → exactly-one-commit check → reviewer
 
 Tasks run on the **standard worker** by default. Two paths put a task on the **hard worker** (`worker-hard` profile, higher thinking level) with its **paired max reviewer** (`reviewer-hard`, declared via `reviewerProfileId` in the worker profile):
 
-1. **Architect mark** — an `executionPlan` task with `"hardWorker": true` (requires explicit `verification` checks) is mapped to `profileId: "worker-hard"` automatically; the Manager must preserve it. Use it sparingly: depth-of-reasoning tasks (safety invariants, concurrency, cross-cutting regressions), not large well-specified work.
+1. **Architect mark** — an `executionPlan` task with `"hardWorker": true` (requires explicit `verification` checks) is mapped to `profileId: "worker-hard"` automatically; the Manager must preserve it. The Architect assigns the class by counting hard characteristics per task (behavior-preserving refactors, system-wide negative invariants, concurrency/ordering invariants, error-path invariants, many distinct test categories): two or more mark the task hard, and a complex initiative may contain many hard tasks. Large well-specified work is not a hard task — it is split.
 2. **Manager escalation** — when a task's review failures show a depth-of-reasoning gap, the recovery Manager can retry it with the edit `{"nodeId":"<task id>","profileId":"worker-hard"}`.
 
 If a worker profile declares `reviewerProfileId`, the paired reviewer is resolved and validated **before** the task is claimed; a missing pair blocks the task with a configuration error instead of burning a worker attempt. Operator role selection (`LAO_PROFILE_*` / `LAO_ROLE_PROFILES`) still wins over per-task profile choices.

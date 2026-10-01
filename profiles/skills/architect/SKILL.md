@@ -44,13 +44,22 @@ The execution plan is system-aware: design task boundaries against the existing 
 
 ## Worker class: standard vs hard
 
-Worker tasks run on a standard worker (high-reasoning model) by default. Mark a task with `"hardWorker": true` in the executionPlan when — and only when — the task's core difficulty is depth of reasoning, not volume of work:
+Worker tasks run on a standard worker (high-reasoning model) by default. Your job is to assign each task to the class that matches its actual difficulty — complex initiatives may contain many hard tasks, and simple initiatives none. Count how many of the **hard characteristics** below a task has:
 
-- the task defines or enforces safety invariants (deletion/GC boundaries, locking, retention rules, recovery from partial state);
-- the task is concurrency-sensitive (races between supervisor/worker/reviewer/lease lifecycles);
-- the task is a cross-cutting change where regressions in existing behavior are the main risk.
+1. **Behavior-preserving refactor** — the task restructures existing code ("refactor X into a shared engine while Y keeps its exact behavior"). Standard workers repeatedly change the preserved behavior in subtle ways.
+2. **System-wide negative invariant** — "never X" across many call sites (deletion/retention boundaries, "no mutation when eligibility fails"). Standard workers implement the main path and miss one mutation site, call site, or recovery path.
+3. **Concurrency/ordering invariant** — locks, leases, rechecks-under-lock, "safe under recheck", races between lifecycles. Standard workers enforce the check at the happy-path point, not at every mutation point.
+4. **Error-path invariant** — non-throwing/contained failure, partial-failure state preservation, failure evidence (events/metrics) on every failure branch. Standard workers build the happy path and swallow or leak errors.
+5. **Many distinct test categories in one task** — five or more separate behaviors that each need focused tests (safety gates, idempotence, retention, injected failures, recovery, events, metrics...). Standard workers write the implementation first and cover only the first one or two categories.
 
-Hard tasks run on a higher-reasoning worker (xhigh) reviewed by a max-reasoning reviewer, so use the mark sparingly: one or two per initiative at most, and always with explicit `verification` checks (hardWorker tasks must list them). A large but well-specified task is NOT a hard task — split it instead. If a standard task fails twice on depth-of-reasoning findings, the manager will promote it to worker-hard; your contract should make that promotion cheap by keeping such tasks' invariants explicit in `invariants` and `verification`.
+**Assignment rule:** 0–1 hard characteristic → standard worker. 2 or more → mark `"hardWorker": true` (it runs on an xhigh worker reviewed by a max reviewer) — and prefer splitting the task first, because a hard task is expensive and review is stricter. A task with a single hard characteristic can stay standard ONLY if its acceptance criteria state that characteristic explicitly and testably (e.g. one named invariant with a named test). Every hardWorker task must list explicit `verification` checks covering each hard characteristic.
+
+Calibration from a real run (all tasks standard/high; the only hard-characteristic task failed review six times before passing):
+
+- **Standard, passed first attempt** — additive policy persistence with locks (7 testable criteria, no behavior to preserve); CLI/MCP flag wiring through an existing submission contract; documentation updates matching implemented behavior.
+- **Hard, failed six times** — "refactor manual pruning into a shared engine" (characteristic 1) with "manual prune retains its existing behavior" (1 again), "never removes epic worktrees/branches/unmerged branches" (2), "safe under recheck" with locks across lease/session/run lifecycles (3), "non-throwing sweeps" plus "partial failures preserve remaining references" (4), and nine distinct test categories (5). The repeated findings were: preserved behavior silently changed, lock not enforced at every mutation point, git errors swallowed as "absent", a recovery call site missed, and test coverage stuck at the first two of nine categories.
+
+Large but well-specified work is NOT a hard task — split it into bounded standard tasks. If you must keep a hard task whole, make the promotion cheap: state its invariants explicitly in `invariants` and give each hard characteristic its own `verification` check and acceptance criterion, so the max reviewer can verify them one by one.
 
 When revising an existing contract, identify what changed and why. The final non-empty line of the visible report must be exactly:
 
