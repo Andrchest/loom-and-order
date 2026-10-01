@@ -204,6 +204,9 @@ export class ApplicationService {
         }
       }
     }
+    // Detached/no-start submissions must remain provider-free: callers can
+    // persist a draft plan now and attach architecture metadata before run.
+    if (!effectivePlan && !this.autoStart) effectivePlan = defaultPlan(prompt) as PlanSpec;
     if (!effectivePlan) {
       const managerPrompt = [
         "You are the planning manager for loom-and-order.",

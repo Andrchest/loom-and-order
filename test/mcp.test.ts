@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ApplicationService } from "../src/application.ts";
 import { processMcpLine } from "../src/mcp.ts";
+
+function makeRepo(parent: string): string {
+  const path = join(parent, "repo");
+  execFileSync("git", ["init", "-b", "main", path]);
+  execFileSync("git", ["-C", path, "config", "user.email", "test@example.invalid"]);
+  execFileSync("git", ["-C", path, "config", "user.name", "Test"]);
+  writeFileSync(join(path, "README.md"), "base\n");
+  execFileSync("git", ["-C", path, "add", "."]);
+  execFileSync("git", ["-C", path, "commit", "-m", "base"]);
+  return path;
+}
 
 function makeService(): { service: ApplicationService; dir: string; initiativeId: string } {
   const dir = mkdtempSync(join(tmpdir(), "loom-and-order-mcp-"));
@@ -61,6 +73,42 @@ test("mcp: tools/list exposes the full tool catalog with schemas", async () => {
     for (const expected of ["submit", "progress", "resume", "message", "supervise_once", "profiles_list"]) {
       assert.ok(names.includes(expected), `missing tool ${expected}`);
     }
+  } finally {
+    service.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("mcp: submit forwards optional autoPrune and resolves the default off", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "loom-and-order-mcp-submit-"));
+  const repo = makeRepo(dir);
+  const service = new ApplicationService({ stateDir: join(dir, "state"), autoStart: false, env: { ...process.env, LAO_AUTO_PRUNE: "true" } });
+  try {
+    const listed = await call(service, { jsonrpc: "2.0", id: 1, method: "tools/list" });
+    const submitTool = listed.result.tools.find((tool: any) => tool.name === "submit");
+    assert.equal(submitTool.inputSchema.properties.autoPrune.type, "boolean");
+
+    const enabled = await call(service, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "submit", arguments: { repo, prompt: "enabled", autoPrune: true } } });
+    const enabledSubmission = JSON.parse(enabled.result.content[0].text);
+    assert.equal(service.store.getAutoPrune(enabledSubmission.initiativeId), true);
+
+    const disabled = await call(service, { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "submit", arguments: { repo, prompt: "disabled", autoPrune: false } } });
+    const disabledSubmission = JSON.parse(disabled.result.content[0].text);
+    assert.equal(service.store.getAutoPrune(disabledSubmission.initiativeId), false);
+  } finally {
+    service.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("mcp: submit uses the documented LAO_AUTO_PRUNE true value when omitted", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "loom-and-order-mcp-submit-env-"));
+  const repo = makeRepo(dir);
+  const service = new ApplicationService({ stateDir: join(dir, "state"), autoStart: false, env: { ...process.env, LAO_AUTO_PRUNE: "true" } });
+  try {
+    const response = await call(service, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "submit", arguments: { repo, prompt: "from env" } } });
+    const submission = JSON.parse(response.result.content[0].text);
+    assert.equal(service.store.getAutoPrune(submission.initiativeId), true);
   } finally {
     service.close();
     rmSync(dir, { recursive: true, force: true });

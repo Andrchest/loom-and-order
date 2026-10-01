@@ -12,7 +12,7 @@ function help(): void {
   console.log(`loom-and-order - durable manager/worker/reviewer/researcher/release runtime
 
 Commands:
-  submit --repo PATH --prompt TEXT [--plan-file PATH] [--architecture-file PATH] [--no-start] [--enable-release]
+  submit --repo PATH --prompt TEXT [--plan-file PATH] [--architecture-file PATH] [--auto-prune] [--no-start] [--enable-release]
   run INITIATIVE_ID
   tree INITIATIVE_ID
   status NODE_OR_INITIATIVE_ID
@@ -48,6 +48,7 @@ Options:
   --gate-json JSON   gate command, e.g. '["npm","test"]'
   --json             machine-readable output
   --enable-release   explicitly enable release/integration profile scheduling
+  --auto-prune       opt in to automatic task/subtask cleanup; LAO_AUTO_PRUNE accepts true, 1, yes, or on (default off)
   --follow           keep polling a live supervisor/feed or session log
   --after ID         feed cursor (exclusive)
   --limit N          maximum feed/events records
@@ -64,7 +65,7 @@ function parseArgs(argv: string[]): { positionals: string[]; values: Record<stri
     const arg = argv[i];
     if (!arg.startsWith("--")) { positionals.push(arg); continue; }
     const key = arg.slice(2);
-    if (key === "no-start" || key === "json" || key === "help" || key === "prometheus" || key === "overwrite" || key === "enable-release" || key === "follow" || key === "watch" || key === "once" || key === "all" || key === "include-epics" || key === "dry-run") { booleans.add(key); values[key] = "true"; continue; }
+    if (key === "no-start" || key === "json" || key === "help" || key === "prometheus" || key === "overwrite" || key === "enable-release" || key === "auto-prune" || key === "follow" || key === "watch" || key === "once" || key === "all" || key === "include-epics" || key === "dry-run") { booleans.add(key); values[key] = "true"; continue; }
     const value = argv[++i];
     if (value === undefined) throw new Error(`missing value for --${key}`);
     values[key] = value;
@@ -144,7 +145,8 @@ async function main(): Promise<void> {
           architecture = parseArchitectureContract(readFileSync(parsed.values["architecture-file"], "utf8"));
           if (!architecture) throw new Error("--architecture-file must contain a valid architecture contract draft");
         }
-        output(await service.submit(repo, prompt, plan, architecture), machine);
+        const submissionOptions = parsed.booleans.has("auto-prune") ? { autoPrune: true } : undefined;
+        output(await service.submit(repo, prompt, plan, architecture, submissionOptions), machine);
         break;
       }
       case "tree": output(service.tree(args[0]), machine); break;
