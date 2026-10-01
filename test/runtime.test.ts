@@ -82,6 +82,56 @@ test("parses a system-aware architecture execution plan and adds its dependencie
   assert.deepEqual(plan.epics[0].tasks[1].dependsOn, ["task-1-1-foundation"]);
 });
 
+test("maps architect hardWorker marks to the worker-hard profile and keeps explicit choices", () => {
+  const contract = parseArchitectureContract(JSON.stringify({
+    summary: "Hard feature",
+    decisions: ["Escalate the invariants task"],
+    constraints: ["Keep scope tight"],
+    invariants: ["Deletion is retention-safe"],
+    interfaces: ["Runtime API"],
+    taskGuidance: ["Use worker-hard for the GC core"],
+    executionPlan: {
+      tasks: [
+        { alias: "plain", title: "Plain", objective: "Simple work", produces: [], deliverables: ["done"], requiredArtifacts: [], prerequisites: [], dependsOn: [], verification: ["test"] },
+        { alias: "hard", title: "Hard", objective: "Invariant-heavy work", produces: [], deliverables: ["done"], requiredArtifacts: [], prerequisites: [], dependsOn: [], verification: ["gc tests"], hardWorker: true },
+        { alias: "explicit", title: "Explicit", objective: "Manager chose", produces: [], deliverables: ["done"], requiredArtifacts: [], prerequisites: [], dependsOn: [], verification: ["test"], hardWorker: true },
+      ],
+      integrationOrder: ["plain", "hard", "explicit"],
+      preflightChecks: ["artifacts"],
+      repairPolicy: "manager review",
+    },
+  }));
+  assert.ok(contract?.executionPlan);
+  const plan = parsePlan(JSON.stringify({ title: "Hard", epics: [{ title: "E", tasks: [{ architectureAlias: "plain", title: "Plain", acceptanceCriteria: ["a"] }, { architectureAlias: "hard", title: "Hard", acceptanceCriteria: ["a"] }, { architectureAlias: "explicit", title: "Explicit", acceptanceCriteria: ["a"], profileId: "researcher" }] }] }));
+  assert.ok(plan);
+  applyArchitectureExecutionPlan(plan, contract.executionPlan);
+  assert.equal(plan.epics[0].tasks[0].profileId, undefined);
+  assert.equal(plan.epics[0].tasks[1].profileId, "worker-hard");
+  assert.equal(plan.epics[0].tasks[2].profileId, "researcher");
+});
+
+test("rejects hardWorker marks that are not true or lack verification checks", () => {
+  const base = (hardWorker: unknown, verification: string[]) => parseArchitectureContract(JSON.stringify({
+    summary: "Hard feature",
+    decisions: ["d"],
+    constraints: ["c"],
+    invariants: ["i"],
+    interfaces: ["f"],
+    taskGuidance: ["g"],
+    executionPlan: {
+      tasks: [{ alias: "t", title: "T", objective: "O", produces: [], deliverables: [], requiredArtifacts: [], prerequisites: [], dependsOn: [], verification, hardWorker }],
+      integrationOrder: ["t"],
+      preflightChecks: ["x"],
+      repairPolicy: "manager review",
+    },
+  }));
+  assert.equal(base("yes", ["test"]), null);
+  assert.equal(base(1, ["test"]), null);
+  assert.equal(base(true, []), null);
+  const valid = base(true, ["gc tests"]);
+  assert.equal(valid?.executionPlan?.tasks[0].hardWorker, true);
+});
+
 test("parses the bounded manager recovery actions strictly", () => {
   for (const action of ["architect", "retry", "block"] as const) {
     const decision = parseManagerDecision(JSON.stringify({ action, nodeId: "task-1", reason: "recorded", edits: [] }));

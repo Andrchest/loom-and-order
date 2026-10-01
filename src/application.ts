@@ -213,6 +213,7 @@ export class ApplicationService {
         "You are responsible only for turning the architecture contract and user request into a strict JSON DAG and launching/routing agents. Do not implement code or author architecture.",
         "Inspect the repository without editing it. Turn the user's request into a strict JSON plan with initiative title, epics, tasks, optional subtasks, explicit dependencies, and testable acceptanceCriteria.",
         "Keep tasks bounded enough for one worker. Every task must include architectureAlias matching an executionPlan task alias. Preserve all Architect dependencies in dependsOn; a task that requires an artifact produced by another task must depend on its producer. Do not include markdown or commentary; return only JSON matching {title,summary?,epics:[{title,description?,tasks:[{architectureAlias,title,description?,dependsOn?,acceptanceCriteria:string[],profileId?:string,subtasks?:[]}]}]}.",
+        "Worker profiles: an executionPlan task with hardWorker:true must get profileId \"worker-hard\" (higher-reasoning worker; its paired max reviewer is selected automatically). Only the Architect can mark tasks as hard — do not invent hardWorker flags, and do not assign worker-hard to tasks the Architect did not mark.",
         this.roleProfile("manager").rolePrompt ?? "",
         `Architecture contract draft:\n${JSON.stringify(architectureDraft)}`,
         `User request:\n${prompt}`,

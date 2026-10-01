@@ -223,6 +223,25 @@ export class Orchestrator {
           });
           continue;
         }
+        // Fail closed on the paired reviewer before claiming: a hard worker
+        // without its max reviewer is a configuration error, not a mid-run
+        // surprise that should burn a worker attempt first.
+        if (profile.reviewerProfileId) {
+          try {
+            this.profileFor(profile.reviewerProfileId);
+          } catch (error) {
+            this.store.recordEvent(current.id, "reviewer_profile_resolution_failed", { profileId: profile.reviewerProfileId, reason: String(error).slice(0, 2000) });
+            this.store.transition(current.id, "blocked", {
+              reason: `paired reviewer profile not configured: ${profile.reviewerProfileId}`,
+              recoveryOwner: "operator",
+              recoveryScope: "task",
+              requiredAction: "configure the paired reviewer profile referenced by the worker profile",
+              unblockCondition: "valid paired reviewer profile",
+              recoveryEpoch: current.recoveryEpoch + 1,
+            });
+            continue;
+          }
+        }
         if (profile.role === "worker" || profile.role === "reviewer" || (profile.role === "release" && this.options.enableRelease)) {
           try {
             const worktrees = this.ensureWorktrees(current, this.findEpic(current));
@@ -506,6 +525,7 @@ export class Orchestrator {
         prompt: [
           "You are the durable manager checkpoint for loom-and-order.",
           "Do not edit files. Review the current task tree and the new user guidance. Return only JSON: {\"action\"?:\"retry\"|\"architect\"|\"block\",\"nodeId\"?:string,\"reason\"?:string,\"edits\":[{\"nodeId\":string,\"title\"?:string,\"description\"?:string,\"acceptanceCriteria\"?:string[],\"dependsOn\"?:string[],\"profileId\"?:string|null}],\"note\"?:string}.",
+          "Profile escalation: a task whose repeated failures point to a depth-of-reasoning gap (concurrency/safety invariants, cross-cutting regressions) can be promoted by adding the edit {\"nodeId\":\"<task id>\",\"profileId\":\"worker-hard\"} — the higher-reasoning worker and its max reviewer take over. Promote only when the evidence justifies it.",
           managerProfile.rolePrompt ?? "",
           `Architecture contract:\n${JSON.stringify(architecture)}`,
           `Task tree:\n${JSON.stringify(tree)}`,
@@ -654,7 +674,10 @@ export class Orchestrator {
       return;
     }
 
-    const reviewerProfile = this.profileFor("reviewer");
+    // Worker profiles can pin a paired reviewer (e.g. worker-hard ->
+    // reviewer-hard): higher-reasoning work is reviewed with max thinking.
+    const reviewerProfile = this.profileFor(profile.reviewerProfileId ?? "reviewer");
+    if (profile.reviewerProfileId) this.store.recordEvent(task.id, "reviewer_profile_selected", { workerProfileId: profile.id, reviewerProfileId: reviewerProfile.id, reviewerThinkingLevel: reviewerProfile.thinkingLevel ?? null });
     let feedbackTurns = 0;
     while (true) {
       if (this.store.getNode(task.id)?.status !== "reviewing") this.store.transition(task.id, "reviewing");
@@ -958,8 +981,9 @@ export class Orchestrator {
     const externalMessages = this.store.pendingMessages(task.initiativeId).map((message) => message.body);
     const managerPrompt = [
       "You are the recovery manager for loom-and-order.",
-      "The worker implementation failed reviewer twice. Choose exactly one recovery action and return only JSON: {\"action\":\"architect\"|\"retry\"|\"block\",\"nodeId\":string,\"reason\":string,\"edits\":[],\"note\":string}.",
+      "The worker implementation failed reviewer twice. Choose exactly one recovery action and return only JSON: {\"action\":\"architect\"|\"retry\"|\"block\",\"nodeId\":string,\"reason\":string,\"edits\":[{\"nodeId\":string,\"profileId\":string}],\"note\":string}.",
       "Do not edit files or author architecture. Choose architect when the contract or task shape must change; choose retry only when an explicit extra attempt is justified; otherwise choose block.",
+      "Escalation to the hard worker: if the findings show a depth-of-reasoning gap (concurrency or safety invariants, cross-cutting regressions, repeatedly missed edge cases) and the task is not already on the worker-hard profile, choose retry and include the edit {\"nodeId\":\"<task id>\",\"profileId\":\"worker-hard\"} so the higher-reasoning worker and its max reviewer run the next attempt. Do not promote for small bounded gaps; the standard worker handles those.",
       managerProfile.rolePrompt ?? "",
       `Task:\n${JSON.stringify({ id: task.id, title: task.title, description: task.description, attempt: task.attempt })}`,
       `Attempt history:\n${JSON.stringify(attemptHistory)}`,

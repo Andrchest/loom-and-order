@@ -119,6 +119,7 @@ export function parseArchitectureContract(text: string): ArchitectureDraft | nul
       ).filter((item: string, index: number, values: string[]) => values.indexOf(item) === index),
       dependsOn: Array.isArray(task?.dependsOn) ? task.dependsOn.map(String).filter((item: string) => item.trim()) : [],
       verification: Array.isArray(task?.verification) ? task.verification.map(String).filter((item: string) => item.trim()) : [],
+      ...(task?.hardWorker === true ? { hardWorker: true } : {}),
     }));
     if (tasks.some((task, index) => {
       const rawTask = rawPlan.tasks[index];
@@ -130,6 +131,8 @@ export function parseArchitectureContract(text: string): ArchitectureDraft | nul
         (rawTask?.requiredArtifacts !== undefined && !hasStringArray("requiredArtifacts")) ||
         (rawTask?.prerequisites !== undefined && !hasStringArray("prerequisites")) ||
         (legacyRequires !== undefined && !hasStringArray("requires")) ||
+        (rawTask?.hardWorker !== undefined && rawTask.hardWorker !== true) ||
+        (task.hardWorker === true && task.verification.length === 0) ||
         task.requiredArtifacts.some((artifact) => task.produces.includes(artifact));
     })) return null;
     const producedArtifacts = new Set<string>();
@@ -231,6 +234,9 @@ export function applyArchitectureExecutionPlan(plan: any, executionPlan?: Archit
     const node = resolve(task.alias) ?? resolve(task.title);
     if (!node) throw new Error(`architecture task is missing from manager plan: ${task.alias}`);
     nodesByArchitectureAlias.set(task.alias, node);
+    // Architect-marked hard tasks run on the higher-reasoning worker and its
+    // paired max reviewer. An explicit manager profileId choice still wins.
+    if (task.hardWorker === true && !node.profileId) node.profileId = "worker-hard";
     for (const dependency of task.dependsOn) {
       const dependencyNode = resolve(dependency);
       if (!dependencyNode) throw new Error(`architecture dependency is missing from manager plan: ${dependency}`);

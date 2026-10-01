@@ -42,6 +42,16 @@ The commit boundary is runtime-owned: the host creates the single task commit wi
 
 The execution plan is system-aware: design task boundaries against the existing repository and runtime, not only against the user-visible feature. The Manager must preserve aliases, and the runner applies declared dependencies before launching workers and places only the affected task in a dependency-preflight recovery checkpoint when required artifacts are absent.
 
+## Worker class: standard vs hard
+
+Worker tasks run on a standard worker (high-reasoning model) by default. Mark a task with `"hardWorker": true` in the executionPlan when — and only when — the task's core difficulty is depth of reasoning, not volume of work:
+
+- the task defines or enforces safety invariants (deletion/GC boundaries, locking, retention rules, recovery from partial state);
+- the task is concurrency-sensitive (races between supervisor/worker/reviewer/lease lifecycles);
+- the task is a cross-cutting change where regressions in existing behavior are the main risk.
+
+Hard tasks run on a higher-reasoning worker (xhigh) reviewed by a max-reasoning reviewer, so use the mark sparingly: one or two per initiative at most, and always with explicit `verification` checks (hardWorker tasks must list them). A large but well-specified task is NOT a hard task — split it instead. If a standard task fails twice on depth-of-reasoning findings, the manager will promote it to worker-hard; your contract should make that promotion cheap by keeping such tasks' invariants explicit in `invariants` and `verification`.
+
 When revising an existing contract, identify what changed and why. The final non-empty line of the visible report must be exactly:
 
 `ARCHITECTURE_RESULT: complete`

@@ -95,13 +95,13 @@ function fakeRaw(runId: string): any {
 }
 
 class FakeRuntime implements AgentRuntime {
-  calls: Array<{ role: string; cwd: string; prompt: string; sessionId?: string; continueSession?: boolean }> = [];
+  calls: Array<{ role: string; cwd: string; prompt: string; profileId: string; sessionId?: string; continueSession?: boolean }> = [];
   private readonly extraWorkerCommit: boolean;
   constructor(extraWorkerCommit = false) {
     this.extraWorkerCommit = extraWorkerCommit;
   }
   async run(input: { role: AgentRole; profile: ProfileManifest; cwd: string; prompt: string; runId: string; agentId?: string }): Promise<AgentResult> {
-    this.calls.push({ role: input.role, cwd: input.cwd, prompt: input.prompt, sessionId: (input as any).sessionId, continueSession: (input as any).continueSession });
+    this.calls.push({ role: input.role, cwd: input.cwd, prompt: input.prompt, profileId: input.profile.id, sessionId: (input as any).sessionId, continueSession: (input as any).continueSession });
     const raw = fakeRaw(input.runId);
     if (input.role === "worker") {
       writeFileSync(join(input.cwd, "worker-output.txt"), `${Date.now()}\n`);
@@ -672,6 +672,51 @@ test("blocks a task with an unconfigured profile instead of crashing the run", a
     assert.match(store.getNode("task")?.failure ?? "", /profile not configured: ghost-profile/);
     assert.equal(runtime.calls.length, 0);
     assert.equal(store.events("task").some((event) => event.kind === "profile_resolution_failed"), true);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pairs a hard worker task with its declared max reviewer profile", async () => {
+  const root = mkdtempSync(join(tmpdir(), "loom-and-order-hardpair-"));
+  const repo = makeRepo(root);
+  const store = new Store(join(root, "state", "state.sqlite3"));
+  const runtime = new FakeRuntime();
+  const workerHard: ProfileManifest = { ...profile, id: "worker-hard", reviewerProfileId: "reviewer-hard" };
+  const reviewerHard: ProfileManifest = { ...reviewer, id: "reviewer-hard" };
+  try {
+    const orchestrator = new Orchestrator(store, runtime, { stateDir: join(root, "state"), gateCommand: ["git", "diff", "--check"], profiles: { worker: profile, reviewer, "worker-hard": workerHard, "reviewer-hard": reviewerHard } });
+    const submitted = orchestrator.submit(repo, "Hard task", { title: "Hard task", epics: [{ title: "E", tasks: [{ id: "task", title: "Task", acceptanceCriteria: ["x"], profileId: "worker-hard" }] }] });
+    const result = await orchestrator.runInitiative(submitted.initiativeId);
+    assert.equal(result.status, "completed");
+    assert.equal(runtime.calls.find((call) => call.role === "worker")?.profileId, "worker-hard");
+    assert.equal(runtime.calls.find((call) => call.role === "reviewer")?.profileId, "reviewer-hard");
+    assert.ok(store.events("task").some((event) => event.kind === "reviewer_profile_selected" && event.payload?.reviewerProfileId === "reviewer-hard"));
+    const standard = orchestrator.submit(repo, "Standard task", { title: "Standard task", epics: [{ title: "E2", tasks: [{ id: "std", title: "Std", acceptanceCriteria: ["x"] }] }] });
+    await orchestrator.runInitiative(standard.initiativeId);
+    assert.equal(runtime.calls.filter((call) => call.role === "reviewer").pop()?.profileId, "reviewer");
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("blocks a hard worker task before launch when its paired reviewer profile is missing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "loom-and-order-hardmissing-"));
+  const repo = makeRepo(root);
+  const store = new Store(join(root, "state", "state.sqlite3"));
+  const runtime = new FakeRuntime();
+  const workerHard: ProfileManifest = { ...profile, id: "worker-hard", reviewerProfileId: "reviewer-hard" };
+  try {
+    const orchestrator = new Orchestrator(store, runtime, { stateDir: join(root, "state"), gateCommand: ["git", "diff", "--check"], profiles: { worker: profile, reviewer, "worker-hard": workerHard } });
+    const submitted = orchestrator.submit(repo, "Missing pair", { title: "Missing pair", epics: [{ title: "E", tasks: [{ id: "task", title: "Task", acceptanceCriteria: ["x"], profileId: "worker-hard" }] }] });
+    const result = await orchestrator.runInitiative(submitted.initiativeId);
+    assert.equal(result.status, "blocked");
+    assert.equal(store.getNode("task")?.status, "blocked");
+    assert.match(store.getNode("task")?.failure ?? "", /paired reviewer profile not configured: reviewer-hard/);
+    assert.equal(runtime.calls.length, 0);
+    assert.ok(store.events("task").some((event) => event.kind === "reviewer_profile_resolution_failed"));
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });

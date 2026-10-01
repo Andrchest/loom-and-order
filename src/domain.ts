@@ -112,6 +112,8 @@ export interface ArchitectureTaskPlan {
   prerequisites: string[];
   dependsOn: string[];
   verification: string[];
+  /** Mark tasks that need the higher-reasoning worker (worker-hard) and its paired max reviewer. */
+  hardWorker?: boolean;
 }
 
 export function isRepositoryRelativePath(value: unknown): value is string {
@@ -179,6 +181,8 @@ export function validateArchitectureContract(value: unknown): asserts value is A
       for (const field of ["produces", "deliverables", "requiredArtifacts", "prerequisites", "dependsOn", "verification"] as const) {
         if (!Array.isArray(task[field]) || task[field].some((item) => typeof item !== "string" || !item.trim())) throw new Error(`architecture task plan ${field} is invalid`);
       }
+      if (task.hardWorker !== undefined && typeof task.hardWorker !== "boolean") throw new Error("architecture task plan hardWorker must be a boolean");
+      if (task.hardWorker === true && !task.verification.length) throw new Error(`architecture task plan ${task.alias} marked hardWorker requires explicit verification checks`);
       for (const field of ["produces", "requiredArtifacts"] as const) {
         if (task[field].some((item) => !isRepositoryRelativePath(item))) throw new Error(`architecture task plan ${field} must contain repository-relative paths only`);
       }

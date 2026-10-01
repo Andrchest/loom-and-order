@@ -85,5 +85,32 @@ contains no concrete personal models — add yours via profiles.
 ## Skills
 
 Role skills live in `profiles/skills/` (`architect`, `manager`, `worker`,
-`reviewer`). Profiles reference them by name and they are materialized into
-each isolated agent directory.
+`worker-hard`, `reviewer`, `reviewer-hard`). Profiles reference them by name
+and they are materialized into each isolated agent directory.
+
+## Worker classes: standard and hard
+
+Tasks run on the **standard worker** by default. A task moves to the **hard
+worker** (`worker-hard`, higher thinking level) with its **paired max
+reviewer** (`reviewer-hard`) through two paths:
+
+1. **Architect mark** — an `executionPlan` task with `"hardWorker": true`
+   (which must list explicit `verification` checks) is mapped to
+   `profileId: "worker-hard"`; the Manager preserves it.
+2. **Manager escalation** — when review failures show a depth-of-reasoning
+   gap, the recovery Manager retries the task with the edit
+   `{"nodeId":"<task id>","profileId":"worker-hard"}`.
+
+The pairing is declared by the worker profile via `reviewerProfileId` (e.g.
+`worker-hard` → `reviewer-hard`). The paired reviewer is resolved and
+validated **before** the task is claimed; a missing pair blocks the task with
+a configuration error instead of burning a worker attempt. Operator role
+selection (`LAO_PROFILE_*` / `LAO_ROLE_PROFILES`) still wins over per-task
+profile choices.
+
+Create the two profiles by cloning the worker/reviewer examples:
+
+```sh
+lao profiles clone example-subscription --id worker-hard --overrides-json '{"role":"worker","thinkingLevel":"xhigh","reviewerProfileId":"reviewer-hard"}'
+lao profiles clone example-subscription --id reviewer-hard --overrides-json '{"role":"reviewer","thinkingLevel":"max"}'
+```

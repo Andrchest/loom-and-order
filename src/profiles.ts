@@ -40,6 +40,8 @@ export interface ProfileManifest {
   maxAttempts: number;
   maxConcurrency?: number;
   rolePrompt?: string;
+  /** Profile ID of the reviewer paired with this worker profile (e.g. worker-hard -> reviewer-hard). */
+  reviewerProfileId?: string;
   pricing?: ModelPricing;
   reviewPolicy?: {
     reviewerRequired?: boolean;

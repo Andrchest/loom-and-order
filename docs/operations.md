@@ -43,6 +43,15 @@ ready → claim (lease) → worker → exactly-one-commit check → reviewer
 - **Gates** are real process runs (auto-detected: `npm test`, Python unittest, …; pinnable via `--gate-json`). A task completes only after pre-merge gate, merge, *and* post-merge epic gate all pass.
 - **Integration** merges the task branch into the epic branch under an epic lock.
 
+### Worker classes: standard and hard
+
+Tasks run on the **standard worker** by default. Two paths put a task on the **hard worker** (`worker-hard` profile, higher thinking level) with its **paired max reviewer** (`reviewer-hard`, declared via `reviewerProfileId` in the worker profile):
+
+1. **Architect mark** — an `executionPlan` task with `"hardWorker": true` (requires explicit `verification` checks) is mapped to `profileId: "worker-hard"` automatically; the Manager must preserve it. Use it sparingly: depth-of-reasoning tasks (safety invariants, concurrency, cross-cutting regressions), not large well-specified work.
+2. **Manager escalation** — when a task's review failures show a depth-of-reasoning gap, the recovery Manager can retry it with the edit `{"nodeId":"<task id>","profileId":"worker-hard"}`.
+
+If a worker profile declares `reviewerProfileId`, the paired reviewer is resolved and validated **before** the task is claimed; a missing pair blocks the task with a configuration error instead of burning a worker attempt. Operator role selection (`LAO_PROFILE_*` / `LAO_ROLE_PROFILES`) still wins over per-task profile choices.
+
 ## Concurrency: leases
 
 The only concurrency control is the **lease**. Claiming a node sets `status = leased`, `lease_owner = executor-<pid>`, `lease_until = now + TTL`, and increments the attempt. The TTL is the profile timeout plus a margin (90 min for the default worker profile), and the owning process refreshes it every 30 s while alive.
