@@ -62,6 +62,24 @@ export class GitWorkspace {
     return git(repoPath, ["branch", "--show-current"]) || "detached";
   }
 
+  branchExists(repoPath: string, branch: string): boolean {
+    try {
+      git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}`]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  deleteBranch(repoPath: string, branch: string): void {
+    if (this.branchExists(repoPath, branch)) git(repoPath, ["branch", "-D", branch]);
+  }
+
+  /** Move a branch ref without touching any working tree. */
+  resetBranch(repoPath: string, branch: string, commit: string): void {
+    git(repoPath, ["update-ref", `refs/heads/${branch}`, commit]);
+  }
+
   createWorktree(repoPath: string, branch: string, path: string, baseRef: string): void {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     git(repoPath, ["worktree", "add", "-b", branch, path, baseRef]);

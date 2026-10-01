@@ -172,3 +172,24 @@ test("findPriorMerge locates a merged task branch and ignores unrelated history"
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("branchExists, deleteBranch, and resetBranch manage branch refs", () => {
+  const root = mkdtempSync(join(tmpdir(), "loom-and-order-branch-"));
+  try {
+    const target = repo(root);
+    const workspace = new GitWorkspace(join(root, "state"));
+    assert.equal(workspace.branchExists(target, "main"), true);
+    assert.equal(workspace.branchExists(target, "loom-and-order/missing"), false);
+    git(target, ["branch", "loom-and-order/spare", "HEAD"]);
+    assert.equal(workspace.branchExists(target, "loom-and-order/spare"), true);
+    workspace.deleteBranch(target, "loom-and-order/spare");
+    assert.equal(workspace.branchExists(target, "loom-and-order/spare"), false);
+    workspace.deleteBranch(target, "loom-and-order/spare");
+    const base = git(target, ["rev-parse", "HEAD"]);
+    git(target, ["commit", "--allow-empty", "-m", "second"]);
+    workspace.resetBranch(target, "main", base);
+    assert.equal(git(target, ["rev-parse", "main"]), base);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
