@@ -1,0 +1,12 @@
+node_modules/
+state/
+*.sqlite
+*.sqlite3
+*.db
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# pi agent per-directory state (quiet-tools cache)
+.pi/
