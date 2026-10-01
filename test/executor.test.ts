@@ -766,3 +766,76 @@ test("executor refreshes the task lease while executing the task", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+class SubtaskFakeRuntime extends FakeRuntime {
+  // Each node writes a unique file so parallel branches never conflict at merge.
+  override async run(input: { role: AgentRole; profile: ProfileManifest; cwd: string; prompt: string; runId: string; agentId?: string }): Promise<AgentResult> {
+    if (input.role === "worker") {
+      const node = input.cwd.split(/[/\\]/).filter(Boolean).pop() ?? "node";
+      writeFileSync(join(input.cwd, `output-${node}.txt`), `${Date.now()}\n`);
+      git(input.cwd, ["add", `output-${node}.txt`]);
+      git(input.cwd, ["commit", "-m", "implement task"]);
+      return { ok: true, output: "implemented", exitCode: 0, runId: input.runId, raw: fakeRaw(input.runId) };
+    }
+    return super.run(input);
+  }
+}
+
+test("runs subtask nodes in their own worktrees and integrates each into the epic", async () => {
+  const root = mkdtempSync(join(tmpdir(), "loom-and-order-subtasks-"));
+  const repo = makeRepo(root);
+  const store = new Store(join(root, "state", "state.sqlite3"));
+  const runtime = new SubtaskFakeRuntime();
+  try {
+    const orchestrator = new Orchestrator(store, runtime, {
+      stateDir: join(root, "state"),
+      gateCommand: ["git", "diff", "--check"],
+      profiles: { worker: profile, reviewer },
+    });
+    const submitted = orchestrator.submit(repo, "Feature with subtasks", {
+      title: "Feature with subtasks",
+      epics: [{ id: "epic", title: "Core", tasks: [
+        { id: "parent", title: "Parent", description: "umbrella task", acceptanceCriteria: ["parent works"],
+          subtasks: [
+            { id: "sub-1", title: "Sub 1", description: "first slice", acceptanceCriteria: ["slice 1 works"] },
+            { id: "sub-2", title: "Sub 2", description: "second slice", dependsOn: ["sub-1"], acceptanceCriteria: ["slice 2 works"] },
+          ] },
+      ] }],
+    });
+    store.saveArchitectureContract({
+      version: 1,
+      revision: 1,
+      initiativeId: submitted.initiativeId,
+      author: { role: "architect", profileId: "architect", model: "fake/architect" },
+      createdAt: new Date().toISOString(),
+      summary: "Test architecture",
+      decisions: ["Use isolated worktrees"],
+      constraints: ["Do not edit main"],
+      invariants: ["Reviewed code only"],
+      interfaces: ["Worker API"],
+      taskGuidance: ["Run focused tests"],
+    });
+    const result = await orchestrator.runInitiative(submitted.initiativeId);
+    assert.equal(result.status, "completed");
+    for (const id of ["parent", "sub-1", "sub-2"]) {
+      const node = store.getNode(id)!;
+      assert.equal(node.status, "completed", `${id} must complete`);
+      assert.ok(node.integratedCommit, `${id} must be integrated into the epic`);
+    }
+    const sub1 = store.getNode("sub-1")!;
+    const sub2 = store.getNode("sub-2")!;
+    assert.notEqual(sub1.worktreePath, sub2.worktreePath, "subtasks get isolated worktrees");
+    assert.equal(sub1.parentId, "parent");
+    const epic = store.getNode("epic")!;
+    // All three commits (parent + both subtasks) landed in the epic worktree.
+    const log = git(epic.worktreePath!, ["log", "--format=%s"]);
+    const merges = log.split("\n").filter((line) => line.startsWith("Merge branch")).length;
+    assert.equal(merges, 3, "parent and both subtasks merge into the epic");
+    assert.equal(log.split("\n").filter((line) => line === "implement task").length, 3);
+    assert.equal(store.metricSummary(submitted.initiativeId).byRole.worker.runs, 3);
+    assert.equal(store.metricSummary(submitted.initiativeId).byRole.reviewer.runs, 3);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
