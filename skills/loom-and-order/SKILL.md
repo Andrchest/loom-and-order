@@ -68,7 +68,7 @@ lao run <initiative-id>
 ### Lifecycle
 | Command | What it does |
 |---|---|
-| `submit --repo PATH --prompt TEXT [--plan-file P] [--architecture-file A] [--no-start] [--enable-release]` | Create an initiative. Without `--plan-file`, Architect + Manager design the DAG. `--no-start` persists without launching (then you must have supplied `--architecture-file`; start later with `run`). `--enable-release` allows release-profile tasks (off by default). |
+| `submit --repo PATH --prompt TEXT [--plan-file P] [--architecture-file A] [--auto-prune] [--no-start] [--enable-release]` | Create an initiative. Without `--plan-file`, Architect + Manager design the DAG. `--auto-prune` opts in to automatic task/subtask cleanup. `--no-start` persists without launching (then you must have supplied `--architecture-file`; start later with `run`). `--enable-release` allows release-profile tasks (off by default). |
 | `run <initiative-id>` | Acquire the initiative run lease, start the built-in supervisor, dispatch all ready work, exit when nothing is ready. Safe to re-run after `resume`. |
 | `pause <initiative-id>` | Stop dispatching new work (active sessions finish). |
 | `resume <node-or-initiative-id>` | Reopen a node and **auto-restart the detached runner** (autoStart). A **task** is resumable from `blocked`, `waiting`, `recovering`, `waiting_*`, `needs_*` — and the bypass of `maxAttempts` is intentional (operator override). An **initiative** resume is allowed only when every blocked/failed task carries a recovery fingerprint or supervisor ownership; domain failures (worker output, reviewer verdicts, gates) throw `non-resumable blockers` — guide those via `message` instead. |
@@ -76,7 +76,32 @@ lao run <initiative-id>
 | `supervise [--follow]` | One supervisor cycle (default) or resident loop (`--follow`). |
 | `supervisor-status` | What the supervisor currently sees. |
 | `deliver <initiative-id>` | Non-destructive delivery of a **completed** initiative: builds a `loom-and-order/deliver-<initiative-id>` branch in the target repo with every completed epic merged in dependency order on top of the target's current HEAD, then runs the repo gate. The target working tree is never touched. Re-running rebuilds the branch. |
-| `prune [initiative-id] [--all] [--include-epics] [--dry-run]` | Remove worktrees of terminal task/subtask nodes. Merged task branches are deleted, unmerged ones are kept for forensics. `--include-epics` also removes completed epic worktrees (their branches are always kept — `deliver` needs them). |
+| `prune [initiative-id] [--all] [--include-epics] [--dry-run]` | Manual cleanup/recovery. Completed/failed task/subtask worktrees may be removed; only merged task/subtask branches are deleted, and unmerged ones are kept for forensics. `--include-epics` also removes completed epic worktrees (their branches are always kept — `deliver` needs them). |
+
+### Automatic GC (opt-in)
+
+Automatic GC is disabled unless explicitly enabled at submission. With the CLI, use:
+
+```bash
+lao submit --repo /path/to/target --prompt "Build ..." --auto-prune
+```
+
+The service also recognizes `LAO_AUTO_PRUNE=true`, `1`, `yes`, or `on` (case-insensitive); unset, false, or any unrecognized value means off. `--auto-prune` is a true-only CLI switch. For MCP, `submit` accepts optional `autoPrune: boolean`: omission resolves the environment default, `true` opts in, and `false` overrides the environment. The resolved choice is persisted per initiative, so detached `--no-start` submissions and later `run`/`resume` retain it; it is not a per-run toggle.
+
+A sweep happens after `run` releases its initiative lease and after each completed supervisor cycle. The built-in supervisor runs only while `run` is alive; keep `lao supervise --follow` running as a companion for unattended work. Automatic GC is not a daemon and does not run between those cycles.
+
+It can act only on a `completed` or `blocked` initiative after every node is terminal (`completed`, `blocked`, or `failed`) and the atomic lock/recheck finds no active node lease, running agent session, active initiative run, or competing GC lock. It removes terminal task/subtask worktrees and deletes a branch only when Git proves it is merged into its owning epic branch. Repeating a sweep is idempotent: cleared worktrees and absent branches are no-op outcomes. **Automatic GC never deletes epic worktrees or epic branches, and it retains every unmerged task/subtask branch.** It also leaves the target checkout and deliver branches alone.
+
+The event feed records `auto_prune_started`, `auto_prune_skipped`, per-node `auto_prune_action`, `auto_prune_failure`, and `auto_prune_completed`; use `lao events --limit 50`, `lao feed <initiative-id> --follow`, or `lao logs <initiative-id>`. `lao metrics <initiative-id>` (or `--prometheus`) reports scheduler sweep counters for removed worktrees, deleted branches, retained branches, skips, and failures. These durable records and GC locks live in the state directory, outside the target repository; events do not contain paths, prompts, credentials, or raw command output.
+
+If a sweep skips or partially fails, it does not change lifecycle status or crash the runner. Run `lao doctor`, inspect events/metrics, and let a later supervisor cycle retry. For explicit recovery or when the feature is off, preview then invoke the shared manual engine:
+
+```bash
+lao prune <initiative-id> --dry-run
+lao prune <initiative-id>
+```
+
+Manual pruning is narrower: it handles completed/failed task/subtask candidates, keeps unmerged branches, and only `--include-epics` removes completed epic worktrees. Never edit SQLite, state-directory worktrees, or branches by hand.
 
 ### Inspection (read-only, safe anytime)
 | Command | What it shows |
@@ -138,6 +163,8 @@ Leases are the only concurrency control. A claimed node carries `lease_owner = e
 3. **Dead-owner probe** — the supervisor checks `kill(pid, 0)` on `executor-<pid>` owners; a dead pid recovers the lease in seconds (this is what saves a crash during `integrating`, which has no agent session).
 
 The built-in supervisor runs **only while a `run` process is alive**. Between runs there is no one recovering. Therefore: **for unattended work, keep `lao supervise --follow` alive as a companion process** (tmux/nohup). `supervise` without `--follow` is one-shot by design.
+
+Automatic GC is scheduled after each completed supervisor cycle, and `run` performs a final sweep only after releasing its initiative run lease. The default supervisor interval is 10 seconds, but a sweep can be skipped when the terminal/lease/session/lock checks are unsafe. A standalone `lao supervise --follow` therefore provides both recovery and periodic GC; it is not a daemon and cannot clean continuously while no supervisor process is running.
 
 After any recovery, a node returns to `pending`; if its attempt count reached `maxAttempts` (3 default), the supervisor blocks it with "exhausted attempts" — that is normal and `resume` fixes it (explicit resume bypasses the bound).
 
@@ -206,7 +233,7 @@ The runtime never installs into global npm/`~/.pi`, never copies host credential
 2. **`resume` costs one fresh attempt** (worker → reviewer → integration, ~10 min typical) — except when the prior-merge path makes integration a ~10 s no-op.
 3. **`maxAttempts` bounds only autonomous recovery.** Explicit `resume` intentionally bypasses it (a task can reach attempt 6 with maxAttempts 3).
 4. **One task = exactly one commit.** Decompose finely; a task that "needs" several logical commits will fail the shape check.
-5. **Worktrees are not garbage-collected automatically.** Use `lao prune <initiative-id>` (add `--include-epics` for completed epics) once an initiative is terminal; `--dry-run` previews. Manual removal of state-dir worktrees is still possible for anything prune refuses.
+5. **Automatic GC is opt-in and conservative.** Submit with `--auto-prune` or an explicit true `LAO_AUTO_PRUNE` value. It may skip or partially fail on unsafe snapshots or Git errors; use `lao prune <initiative-id> --dry-run` followed by `lao prune <initiative-id>` for manual recovery. Automatic GC never deletes epic worktrees or epic branches and retains unmerged task/subtask branches; `--include-epics` is a deliberate manual-only choice for completed epic worktrees.
 6. **Leases are PID-based** (`executor-<pid>`). Fine on a single host; do not run two hosts against one state dir (PID namespaces break the dead-owner probe).
 7. **`progress`/`tree`/`status` are read-only** — safe to poll aggressively. `message`/`plan-edit`/`resume`/`pause` are the only state writers besides `run`/`supervise`/`recover`.
 8. **The clean-checkout guard is real**: untracked garbage in the target repo (including stray directories) fails `submit` with "source checkout is not clean". Only runner-owned `.pi/quiet-tools/` artifacts are allowed.

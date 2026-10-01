@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Orchestrator, profileDimensions, providerFailure, runtimeCounters, type Submission } from "./executor.ts";
+import { Orchestrator, profileDimensions, providerFailure, runtimeCounters, type Submission, type SubmissionOptions } from "./executor.ts";
 import { Supervisor } from "./supervisor.ts";
 import { applyArchitectureExecutionPlan, parseArchitectureContract, parsePlan, PiAgentRuntime, defaultPlan, type AgentRuntime, type ArchitectureDraft } from "./runtime.ts";
 import { CustomProfileStore, loadModelCatalog, loadProfile, materializeCatalogProfiles, parseRoleProfileSelection, validateProfileManifest, type ProfileManifest, type RoleProfileSelection } from "./profiles.ts";
@@ -52,6 +52,7 @@ export interface ServiceOptions {
   autoStart?: boolean;
   enableRelease?: boolean;
   runtime?: AgentRuntime;
+  env?: NodeJS.ProcessEnv;
 }
 
 function normalizeProfile(profile: ProfileManifest, projectRoot: string): ProfileManifest {
@@ -80,6 +81,7 @@ export class ApplicationService {
   readonly toolchain: ToolchainManager;
   readonly autoStart: boolean;
   readonly gateCommand: string[];
+  readonly env: NodeJS.ProcessEnv;
   private gitWorkspace: GitWorkspace | null = null;
 
   private git(): GitWorkspace {
@@ -90,6 +92,7 @@ export class ApplicationService {
   constructor(options: ServiceOptions = {}) {
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
     this.projectRoot = resolve(options.projectRoot ?? PROJECT_ROOT);
+    this.env = options.env ?? process.env;
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     this.store = new Store(join(this.stateDir, "state.sqlite3"));
     this.toolchain = new ToolchainManager(this.stateDir);
@@ -109,7 +112,7 @@ export class ApplicationService {
     const duplicate = allProfiles.find((profile, index) => allProfiles.findIndex((candidate) => candidate.id === profile.id) !== index);
     if (duplicate) throw new Error(`duplicate profile id: ${duplicate.id}`);
     this.profiles = Object.fromEntries(allProfiles.map((profile) => [profile.id, profile]));
-    this.roleSelection = parseRoleProfileSelection(process.env);
+    this.roleSelection = parseRoleProfileSelection(this.env);
     for (const [role, profileId] of Object.entries(this.roleSelection)) {
       const profile = this.profiles[profileId];
       if (!profile) throw new Error(`role profile selection ${role} -> ${profileId}: profile not configured`);
@@ -120,10 +123,10 @@ export class ApplicationService {
       gateCommand: options.gateCommand ?? gateFromEnvironment(),
       profiles: this.profiles,
       enableRelease: options.enableRelease ?? false,
-      env: process.env,
+      env: this.env,
       roleSelection: this.roleSelection,
     });
-    this.supervisor = new Supervisor(this.store, { profiles: this.profiles });
+    this.supervisor = new Supervisor(this.store, { profiles: this.profiles, onCycle: () => { this.runAutomaticGc(); } });
     this.autoStart = options.autoStart ?? true;
     this.gateCommand = options.gateCommand ?? gateFromEnvironment();
   }
@@ -142,11 +145,14 @@ export class ApplicationService {
     return profile;
   }
 
-  async submit(repoPath: string, prompt: string, plan?: PlanSpec, suppliedArchitecture?: ArchitectureDraft): Promise<Submission> {
+  async submit(repoPath: string, prompt: string, plan?: PlanSpec, suppliedArchitecture?: ArchitectureDraft | SubmissionOptions, options?: SubmissionOptions): Promise<Submission> {
     const repo = resolve(repoPath);
+    const inlineOptions = suppliedArchitecture && "autoPrune" in suppliedArchitecture ? suppliedArchitecture as SubmissionOptions : undefined;
+    const submissionOptions = options ?? inlineOptions ?? {};
+    const resolvedAutoPrune = submissionOptions.autoPrune ?? /^(1|true|yes|on)$/i.test(this.env.LAO_AUTO_PRUNE ?? "");
     if (this.autoStart) await this.ensureToolchain();
     let effectivePlan = plan;
-    let architectureDraft: ArchitectureDraft | null = suppliedArchitecture ?? null;
+    let architectureDraft: ArchitectureDraft | null = inlineOptions ? null : suppliedArchitecture as ArchitectureDraft | undefined ?? null;
     let architectureRun: any = null;
     let planningRun: any = null;
     if (this.autoStart) {
@@ -198,6 +204,9 @@ export class ApplicationService {
         }
       }
     }
+    // Detached/no-start submissions must remain provider-free: callers can
+    // persist a draft plan now and attach architecture metadata before run.
+    if (!effectivePlan && !this.autoStart) effectivePlan = defaultPlan(prompt) as PlanSpec;
     if (!effectivePlan) {
       const managerPrompt = [
         "You are the planning manager for loom-and-order.",
@@ -253,7 +262,7 @@ export class ApplicationService {
       }
     }
     this.validatePlanProfiles(effectivePlan ?? defaultPlan(prompt) as PlanSpec);
-    const submission = this.orchestrator.submit(repo, prompt, effectivePlan ?? defaultPlan(prompt) as PlanSpec);
+    const submission = this.orchestrator.submit(repo, prompt, effectivePlan ?? defaultPlan(prompt) as PlanSpec, { autoPrune: resolvedAutoPrune });
     if (architectureDraft) {
       const architectProfile = this.roleProfile("architect");
       this.store.saveArchitectureContract({
@@ -313,6 +322,9 @@ export class ApplicationService {
     } finally {
       this.supervisor.stop();
       this.store.releaseInitiativeRun(initiativeId, owner);
+      // A runner owns the active-run lease until this point. The sweep is
+      // deliberately after release so its eligibility snapshot can be safe.
+      this.runAutomaticGc(initiativeId);
     }
   }
 
@@ -562,44 +574,195 @@ export class ApplicationService {
   }
 
   /**
-   * Garbage-collect worktrees of terminal nodes. Task/subtask worktrees are
-   * removed when their node is completed or failed; merged task branches are
-   * deleted, unmerged ones are kept for forensics. Epic worktrees are only
-   * removed with `includeEpics` and only for completed epics (their branches
-   * are always kept: `deliver` needs them). Dry-run reports without acting.
+   * Manual pruning and automatic GC deliberately share this engine. Automatic
+   * callers pass a terminal, locked snapshot and are additionally prevented
+   * from touching epics or deliver branches.
    */
   prune(options: { initiativeId?: string; all?: boolean; includeEpics?: boolean; dryRun?: boolean } = {}): any {
     if (!options.initiativeId && !options.all) throw new Error("prune requires an initiative id or --all");
-    const git = this.git();
     const initiatives = options.all
       ? this.store.listInitiatives()
       : [this.store.getNode(options.initiativeId!)].filter((node): node is NonNullable<typeof node> => Boolean(node));
     if (!initiatives.length) throw new Error(`unknown initiative: ${options.initiativeId ?? ""}`);
+    return this.pruneEngine(initiatives, { automatic: false, includeEpics: options.includeEpics ?? false, dryRun: options.dryRun ?? false });
+  }
+
+  /** Run restricted, non-throwing automatic sweeps after a scheduler boundary. */
+  runAutomaticGc(initiativeId?: string): { sweeps: any[] } {
+    const initiatives = initiativeId
+      ? [this.store.getNode(initiativeId)].filter((node): node is NonNullable<typeof node> => Boolean(node))
+      : this.store.listInitiatives().filter((node) => node.autoPrune || node.status === "completed" || node.status === "blocked");
+    return { sweeps: initiatives.map((initiative) => this.automaticSweep(initiative)) };
+  }
+
+  // Alias kept intentionally small for application clients that call the
+  // feature by its operator-facing name.
+  automaticPrune(initiativeId?: string): { sweeps: any[] } {
+    return this.runAutomaticGc(initiativeId);
+  }
+
+  private automaticSweep(initiative: NonNullable<ReturnType<Store["getNode"]>>): any {
+    const startedAt = Date.now();
+    const counters = { removed_worktrees: 0, deleted_branches: 0, retained_branches: 0, skips: 0, failures: 0 };
+    const owner = `gc-${process.pid}-${randomUUID()}`;
+    this.store.recordEvent(initiative.id, "auto_prune_started", { mode: "automatic" });
+    const finish = (status: "completed" | "skipped"): any => {
+      this.store.recordMetric({
+        initiativeId: initiative.id,
+        runId: owner,
+        role: "scheduler",
+        outcome: counters.failures ? "failure" : status === "skipped" ? "blocked" : "success",
+        durationMs: Date.now() - startedAt,
+        counters,
+        dimensions: { status: status === "skipped" ? "skipped" : "completed" },
+      });
+      this.store.recordEvent(initiative.id, "auto_prune_completed", { status, ...counters });
+      return { initiativeId: initiative.id, status, ...counters };
+    };
+    try {
+      const eligibility = this.store.checkGcEligibility(initiative.id);
+      if (!eligibility.eligible || !this.store.acquireGcLock(initiative.id, owner)) {
+        counters.skips += 1;
+        this.store.recordEvent(initiative.id, "auto_prune_skipped", { reason: eligibility.reason ?? "gc_lock_conflict" });
+        return finish("skipped");
+      }
+      try {
+        // acquireGcLock performs the first atomic check. This second check is
+        // intentionally under that lock, immediately before any Git action.
+        const recheck = this.store.checkGcEligibility(initiative.id, new Date(), owner);
+        if (!recheck.eligible) {
+          counters.skips += 1;
+          this.store.recordEvent(initiative.id, "auto_prune_skipped", { reason: recheck.reason ?? "unsafe_recheck" });
+          return finish("skipped");
+        }
+        const current = this.store.getNode(initiative.id);
+        if (!current) {
+          counters.skips += 1;
+          this.store.recordEvent(initiative.id, "auto_prune_skipped", { reason: "unknown_initiative" });
+          return finish("skipped");
+        }
+        const result = this.pruneEngine([current], { automatic: true, includeEpics: false, dryRun: false, counters });
+        return { ...finish("completed"), actionCount: result.actions.length };
+      } finally {
+        this.store.releaseGcLock(initiative.id, owner);
+      }
+    } catch {
+      // Git and state failures must never change initiative lifecycle state or
+      // make a runner/supervisor cycle fail. The bounded event omits details.
+      counters.failures += 1;
+      this.store.recordEvent(initiative.id, "auto_prune_failure", { operation: "sweep" });
+      try { this.store.releaseGcLock(initiative.id, owner); } catch { /* best effort */ }
+      return finish("completed");
+    }
+  }
+
+  private pruneEngine(
+    initiatives: NonNullable<ReturnType<Store["getNode"]>>[],
+    options: { automatic: boolean; includeEpics: boolean; dryRun: boolean; counters?: { removed_worktrees: number; deleted_branches: number; retained_branches: number; skips: number; failures: number } },
+  ): { dryRun: boolean; actions: Array<{ nodeId: string; level: string; status: string; action: string; detail: string }> } {
+    const git = this.git();
     const report: Array<{ nodeId: string; level: string; status: string; action: string; detail: string }> = [];
+    const counters = options.counters;
+    const terminal = options.automatic ? ["completed", "blocked", "failed"] : ["completed", "failed"];
+    const eventFailure = (initiativeId: string, nodeId: string, operation: string): void => {
+      if (!options.automatic) return;
+      if (counters) counters.failures += 1;
+      this.store.recordEvent(nodeId || initiativeId, "auto_prune_failure", { operation });
+    };
+    const actionEvent = (nodeId: string, action: string): void => {
+      if (options.automatic) this.store.recordEvent(nodeId, "auto_prune_action", { action });
+    };
+    const owningEpic = (node: any, nodes: any[]): any | null => {
+      let parent = nodes.find((candidate) => candidate.id === node.parentId) ?? null;
+      while (parent && parent.level !== "epic") parent = nodes.find((candidate) => candidate.id === parent.parentId) ?? null;
+      return parent;
+    };
+    const mergedIntoOwner = (initiative: any, node: any, nodes: any[]): boolean => {
+      if (!node.branch || !git.branchExists(initiative.repoPath!, node.branch)) return false;
+      const epic = owningEpic(node, nodes);
+      if (!epic?.branch) return false;
+      // Automatic GC never relies on a removable parent worktree: the task
+      // ref must be an ancestor of its owning epic ref.
+      if (options.automatic) return git.isAncestor(initiative.repoPath!, node.branch, epic.branch);
+      const parent = nodes.find((candidate) => candidate.id === node.parentId);
+      return git.isAncestor(parent?.worktreePath ?? initiative.repoPath!, node.branch);
+    };
+    const safeWorktree = (initiative: any, path: string): boolean => {
+      if (!options.automatic) return true;
+      const checkout = resolve(initiative.repoPath!);
+      const candidate = resolve(path);
+      return candidate !== checkout && !candidate.startsWith(`${checkout}/`);
+    };
+
     for (const initiative of initiatives) {
       const nodes = this.store.listNodes(initiative.id);
-      const work = nodes.filter((node) => ["task", "subtask"].includes(node.level));
-      for (const node of work) {
-        if (!["completed", "failed"].includes(node.status)) {
-          if (node.worktreePath) report.push({ nodeId: node.id, level: node.level, status: node.status, action: "skipped", detail: "node is not terminal" });
+      const protectedBranches = new Set(nodes.filter((candidate) => candidate.level === "epic" && candidate.branch).map((candidate) => candidate.branch!));
+      let checkoutBranchKnown = true;
+      if (options.automatic) {
+        try {
+          const checkoutBranch = git.branch(initiative.repoPath!);
+          if (checkoutBranch !== "detached") protectedBranches.add(checkoutBranch);
+        } catch { checkoutBranchKnown = false; }
+      }
+      for (const node of nodes.filter((candidate) => ["task", "subtask"].includes(candidate.level))) {
+        if (!terminal.includes(node.status)) {
+          if (node.worktreePath) {
+            report.push({ nodeId: node.id, level: node.level, status: node.status, action: "skipped", detail: "node is not terminal" });
+            if (options.automatic && counters) counters.skips += 1;
+          }
           continue;
         }
         if (!node.worktreePath && !node.branch) continue;
-        const merged = node.branch ? git.isAncestor(this.store.getNode(node.parentId ?? node.id)!.worktreePath ?? initiative.repoPath!, node.branch) : false;
         const actions: string[] = [];
+        let worktreeRemoved = !node.worktreePath || options.dryRun;
         if (node.worktreePath) {
-          if (!options.dryRun) {
-            try { git.removeWorktree(initiative.repoPath!, node.worktreePath); } catch (error) { throw new Error(`worktree removal failed for ${node.id}: ${String(error)}`); }
-            this.store.clearWorktree(node.id);
+          if (!safeWorktree(initiative, node.worktreePath)) {
+            eventFailure(initiative.id, node.id, "unsafe_worktree");
+            continue;
           }
-          actions.push("worktree removed");
+          if (!options.dryRun) {
+            try {
+              git.removeWorktree(initiative.repoPath!, node.worktreePath);
+              this.store.clearWorktree(node.id);
+              worktreeRemoved = true;
+            } catch (error) {
+              eventFailure(initiative.id, node.id, "worktree_remove");
+              if (options.automatic) continue;
+              throw new Error(`worktree removal failed for ${node.id}: ${String(error)}`);
+            }
+          }
+          if (worktreeRemoved || options.dryRun) {
+            actions.push("worktree removed");
+            if (options.automatic && counters && !options.dryRun) counters.removed_worktrees += 1;
+            actionEvent(node.id, "worktree_removed");
+          }
         }
-        if (node.branch) {
-          if (merged) {
-            if (!options.dryRun) git.deleteBranch(initiative.repoPath!, node.branch);
+        if (node.branch && worktreeRemoved) {
+          if (options.automatic && !checkoutBranchKnown) {
+            eventFailure(initiative.id, node.id, "branch_safety");
+            continue;
+          }
+          if (protectedBranches.has(node.branch) || node.branch.startsWith("loom-and-order/deliver-")) {
+            report.push({ nodeId: node.id, level: node.level, status: node.status, action: "branch-kept", detail: node.branch.startsWith("loom-and-order/deliver-") ? "deliver branch retained" : "protected epic branch retained" });
+            if (options.automatic && counters) counters.retained_branches += 1;
+          } else if (!git.branchExists(initiative.repoPath!, node.branch) && options.automatic) {
+            // Missing branch is an automatic idempotent no-op.
+          } else if (mergedIntoOwner(initiative, node, nodes)) {
+            if (!options.dryRun) {
+              try { git.deleteBranch(initiative.repoPath!, node.branch); }
+              catch (error) {
+                eventFailure(initiative.id, node.id, "branch_delete");
+                if (!options.automatic) throw new Error(`branch deletion failed for ${node.id}: ${String(error)}`);
+                continue;
+              }
+            }
             actions.push(`branch deleted (merged into parent: ${node.branch})`);
+            if (options.automatic && counters && !options.dryRun) counters.deleted_branches += 1;
+            actionEvent(node.id, "branch_deleted");
           } else {
             report.push({ nodeId: node.id, level: node.level, status: node.status, action: "branch-kept", detail: `unmerged branch ${node.branch} kept for forensics` });
+            if (options.automatic && counters) counters.retained_branches += 1;
+            actionEvent(node.id, "branch_retained");
           }
         }
         if (actions.length) report.push({ nodeId: node.id, level: node.level, status: node.status, action: options.dryRun ? "would-prune" : "pruned", detail: actions.join("; ") });
@@ -615,7 +778,7 @@ export class ApplicationService {
         }
       }
     }
-    return { dryRun: options.dryRun ?? false, actions: report };
+    return { dryRun: options.dryRun, actions: report };
   }
 
   logs(nodeId?: string): any[] {

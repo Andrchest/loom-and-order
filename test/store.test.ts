@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { prometheus } from "../src/metrics.ts";
-import { Store } from "../src/store.ts";
+import { SCHEMA_VERSION, Store } from "../src/store.ts";
 
 function makeStore(): { store: Store; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), "loom-and-order-store-"));
@@ -434,7 +434,7 @@ test("subtasks persist, go ready, unlock by dependency, and are claimed like tas
 test("stamps fresh databases with the current schema version", () => {
   const { store, dir } = makeStore();
   try {
-    assert.equal(store.schemaVersion(), 1);
+    assert.equal(store.schemaVersion(), SCHEMA_VERSION);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -457,12 +457,68 @@ test("migrates pre-versioning databases (user_version=0) to current, keeping dat
 
   const reopened = new Store(dbPath);
   try {
-    assert.equal(reopened.schemaVersion(), 1);
+    assert.equal(reopened.schemaVersion(), SCHEMA_VERSION);
     const rows = (reopened.db.prepare("SELECT payload_json FROM events WHERE kind = 'lifecycle_probe'").all()) as Array<{ payload_json: string }>;
     assert.equal(rows.length, 1);
     assert.match(rows[0].payload_json, /keep-me/);
   } finally {
     reopened.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("persists automatic GC policy atomically and migrates a v1 plan without loss", () => {
+  const dir = mkdtempSync(join(tmpdir(), "loom-and-order-gc-policy-"));
+  const dbPath = join(dir, "state.sqlite3");
+  const plan = { title: "Policy", epics: [{ id: "policy-epic", title: "Epic", tasks: [{ id: "policy-task", title: "Task" }] }] };
+  const first = new Store(dbPath);
+  const disabled = first.createPlan({ plan: { title: "Disabled", epics: [{ id: "disabled-epic", title: "Epic", tasks: [{ id: "disabled-task", title: "Task" }] }] }, repoPath: "/repo", baseCommit: "base" });
+  const enabled = first.createPlan({ plan, repoPath: "/repo", baseCommit: "base", autoPrune: true });
+  assert.equal(first.getAutoPrune(disabled.initiativeId), false);
+  assert.equal(first.getAutoPrune(enabled.initiativeId), true);
+  first.recordEvent(enabled.initiativeId, "policy_probe", { retained: true });
+  first.close();
+
+  // Remove the v2 column and stamp a genuine v1 user_version while retaining
+  // all DAG and event rows, then let the versioned migration restore it.
+  const raw = new DatabaseSync(dbPath);
+  raw.exec("ALTER TABLE nodes DROP COLUMN auto_prune; PRAGMA user_version = 1;");
+  raw.close();
+  const reopened = new Store(dbPath);
+  try {
+    assert.equal(reopened.schemaVersion(), SCHEMA_VERSION);
+    assert.equal(reopened.getNode(enabled.initiativeId)?.title, "Policy");
+    assert.equal(reopened.getAutoPrune(enabled.initiativeId), false, "v1 policies default off");
+    assert.equal(reopened.getNode(disabled.initiativeId)?.id, disabled.initiativeId);
+    assert.equal(reopened.events(enabled.initiativeId).some((event) => event.kind === "policy_probe"), true);
+  } finally {
+    reopened.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rejects unsafe GC snapshots and coordinates an exclusive recoverable lock", () => {
+  const { store, dir } = makeStore();
+  try {
+    const unsafe = store.createPlan({ plan: basePlan, repoPath: "/repo", baseCommit: "abc", autoPrune: true });
+    assert.equal(store.checkGcEligibility(unsafe.initiativeId).eligible, false);
+    assert.equal(store.getGcLock(unsafe.initiativeId), null);
+
+    const safe = store.createPlan({ plan: { title: "Safe", epics: [{ id: "safe-epic", title: "Epic", tasks: [{ id: "safe-task", title: "Task" }] }] }, repoPath: "/repo", baseCommit: "abc", autoPrune: true });
+    store.claim("safe-task", "worker", 60_000);
+    store.transition("safe-task", "running");
+    store.transition("safe-task", "completed");
+    store.refreshRollups(safe.initiativeId);
+    assert.equal(store.checkGcEligibility(safe.initiativeId).eligible, true);
+    assert.equal(store.acquireGcLock(safe.initiativeId, "gc-one"), true);
+    assert.equal(store.acquireGcLock(safe.initiativeId, "gc-two"), false);
+    assert.equal(store.releaseGcLock(safe.initiativeId, "gc-two"), false);
+    assert.equal(store.getGcLock(safe.initiativeId)?.owner, "gc-one");
+    assert.equal(store.releaseGcLock(safe.initiativeId, "gc-one"), true);
+    assert.equal(store.getGcLock(safe.initiativeId), null);
+    assert.equal(store.acquireGcLock(safe.initiativeId, "gc-recovered", 999999), true, "dead owners are recoverable");
+  } finally {
+    store.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

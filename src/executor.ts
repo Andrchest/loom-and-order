@@ -26,6 +26,11 @@ export interface ExecutorOptions {
 export interface Submission {
   initiativeId: string;
   epicIds: string[];
+  autoPrune: boolean;
+}
+
+export interface SubmissionOptions {
+  autoPrune?: boolean;
 }
 
 const MAX_CONVERSATIONAL_FEEDBACK_TURNS = 1;
@@ -149,12 +154,25 @@ export class Orchestrator {
     return this.options.env ?? process.env;
   }
 
-  submit(repoPath: string, prompt: string, plan?: PlanSpec): Submission {
+  submit(repoPath: string, prompt: string, plan?: PlanSpec, options: SubmissionOptions | boolean = {}): Submission {
     this.git.assertRepository(repoPath);
     this.git.assertClean(repoPath);
     const baseCommit = this.git.head(repoPath);
     const effectivePlan = plan ?? defaultPlan(prompt) as PlanSpec;
-    return this.store.createPlan({ plan: effectivePlan, repoPath, baseCommit });
+    const autoPrune = typeof options === "boolean" ? options : options.autoPrune === true;
+    return this.store.createPlan({ plan: effectivePlan, repoPath, baseCommit, autoPrune });
+  }
+
+  gcEligibility(initiativeId: string): ReturnType<Store["checkGcEligibility"]> {
+    return this.store.checkGcEligibility(initiativeId);
+  }
+
+  acquireGcLock(initiativeId: string, owner = `gc-${process.pid}-${randomUUID()}`): boolean {
+    return this.store.acquireGcLock(initiativeId, owner);
+  }
+
+  releaseGcLock(initiativeId: string, owner: string): boolean {
+    return this.store.releaseGcLock(initiativeId, owner);
   }
 
   async runInitiative(initiativeId: string): Promise<NodeRecord> {

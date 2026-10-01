@@ -111,12 +111,42 @@ Each epic has its own branch and worktree; completed tasks merge into it (post-m
 
 When the initiative is `completed`, `lao deliver <initiative-id>` builds a `loom-and-order/deliver-<initiative-id>` branch in the target repository: every completed epic branch is merged, in dependency order, on top of the target's current HEAD, in a throwaway worktree, and the result must pass the repository gate. Your working tree and its checked-out branch are never touched, and re-running the command rebuilds the branch from scratch. You then review and merge the deliver branch yourself — the final integration policy (rebase? squash? PR?) is yours.
 
-`lao prune <initiative-id> [--all] [--include-epics] [--dry-run]` reclaims disk: worktrees of terminal task/subtask nodes are removed, merged task branches are deleted (unmerged ones are kept for forensics), and completed epic worktrees go only with `--include-epics`. Epic **branches** are always kept because `deliver` needs them.
+### Pruning and automatic GC
 
-Consequences to plan for:
+Automatic GC is an opt-in use of the same prune engine. Enable it when submitting:
 
-- Prune terminal initiatives after delivery; `--dry-run` previews.
-- A delivered-and-deleted state dir loses the event history; archive `state.sqlite3` if you want the audit trail.
+```bash
+lao submit --repo /path/to/repo --prompt "Build ..." --auto-prune
+```
+
+The environment equivalent is `LAO_AUTO_PRUNE=true` (also `1`, `yes`, or `on`, case-insensitive). Unset or any other value is false. The resolved policy is persisted on the initiative, including for `--no-start` submissions; it is not re-decided when a later `run` or `resume` starts. MCP `submit` accepts optional `autoPrune: true|false`: omission uses `LAO_AUTO_PRUNE`, and `false` overrides it.
+
+A sweep runs after a normal runner releases its initiative run lease and after each supervisor cycle. The built-in supervisor cycles while `run` is alive; a standalone `lao supervise --follow` is the companion for unattended work. The sweep is best-effort and never changes initiative lifecycle status.
+
+#### Eligibility and safety
+
+Automatic GC can act only when the initiative is `completed` or `blocked`, every node is terminal (`completed`, `blocked`, or `failed`), and the atomic eligibility check finds no active node lease, running agent session, active initiative run, or competing GC lock. The check is performed again after the per-initiative GC lock is acquired, immediately before Git work. A dead lock owner can be reclaimed; an active owner blocks the sweep.
+
+Only terminal task/subtask nodes are candidates. Their worktrees are removed first. A branch is deleted only after the worktree is gone and Git proves the task/subtask branch is an ancestor of its owning epic branch; the parent worktree is not needed for this proof. Missing worktrees or branches are idempotent no-ops. **Automatic GC never deletes epic worktrees or epic branches, and it retains every unmerged task/subtask branch.** It also protects the target checkout and `loom-and-order/deliver-*` branches.
+
+#### Observability
+
+Automatic sweeps append bounded events to the durable event log: `auto_prune_started`, `auto_prune_skipped` (with a reason such as nonterminal state, active lease/session/run, disabled policy, or lock conflict), `auto_prune_action` for worktree/branch removal or branch retention, `auto_prune_failure` for a failed operation, and `auto_prune_completed` with status and counters. GC lock acquisition/release is evented too. Events contain no paths, prompts, credentials, or raw command output. Read them with `lao events --limit N`, `lao feed <initiative-id> --follow`, or `lao logs <initiative-id>`.
+
+Each sweep records a scheduler metric visible through `lao metrics <initiative-id>` (or `--prometheus`) with bounded counters: `removed_worktrees`, `deleted_branches`, `retained_branches`, `skips`, and `failures`. `progress` also includes the initiative metric summary.
+
+#### Failure recovery and manual fallback
+
+Git/state errors are contained: the failure event and metric are recorded, the failed artifact and any remaining branch/durable reference are preserved, and the runner or supervisor continues. A later eligible sweep can retry; repeated sweeps do not repeat completed destructive actions. Diagnose with `lao doctor`, then inspect `lao events --limit 50`, `lao progress <initiative-id>`, and `lao metrics <initiative-id>`. Do not edit SQLite, state-directory worktrees, or branches by hand.
+
+Use the explicit manual engine when automatic GC is disabled, skipped, or incomplete:
+
+```bash
+lao prune <initiative-id> --dry-run
+lao prune <initiative-id>
+```
+
+Manual pruning considers completed/failed task/subtask worktrees and deletes only branches whose ancestry is proven from the relevant parent worktree; automatic GC uses the owning epic branch ref for that proof. Unmerged branches are retained for forensics. `--all` applies the operation to all initiatives; `--include-epics` deliberately removes completed epic worktrees, while epic branches are always kept for `deliver`. Manual pruning is the recovery fallback, not an automatic delivery or merge step. A delivered-and-deleted state dir loses the event history; archive `state.sqlite3` if you want the audit trail.
 
 ## Trust model
 
@@ -131,7 +161,7 @@ Nothing here promises LLM correctness or protection from a compromised host/kern
 | Limit | Impact | Mitigation |
 |---|---|---|
 | No daemon supervision | Crashes between `run`s stall up to 90 min (TTL) if no companion supervisor | keep `supervise --follow` alive for unattended work |
-| No automatic worktree GC | Disk grows with initiatives | `lao prune` after delivery (`--include-epics` for epics) |
+| Automatic GC is opt-in and best-effort | Disabled policy, unsafe snapshots, lock conflicts, or Git failures can leave artifacts | Enable with `--auto-prune`/`LAO_AUTO_PRUNE=true`; inspect events and metrics, then use `lao prune` as the manual fallback |
 | Deliver branch is not merged for you | The host owns the final integration boundary | review and merge `loom-and-order/deliver-<initiative-id>` yourself |
 | PID-based leases | One host per state dir; PID reuse risk | TTL backstop; do not share state dirs across hosts |
 | Single-commit invariant | Coarse tasks fail shape checks | decompose finely (Architect guidance) |
