@@ -42,6 +42,28 @@ const reviewer: ProfileManifest = { ...profile, id: "reviewer", role: "reviewer"
 const researcher: ProfileManifest = { ...profile, id: "researcher", role: "researcher", pool: "codex" };
 const release: ProfileManifest = { ...profile, id: "release", role: "release", pool: "codex", reviewPolicy: { reviewerRequired: true, gateRequired: true, allowIntegration: true } };
 
+test("submission forwards the durable automatic GC policy", () => {
+  const root = mkdtempSync(join(tmpdir(), "loom-and-order-submit-policy-"));
+  const repo = makeRepo(root);
+  const store = new Store(join(root, "state", "state.sqlite3"));
+  try {
+    const orchestrator = new Orchestrator(store, new FakeRuntime(), {
+      stateDir: join(root, "state"),
+      gateCommand: ["git", "diff", "--check"],
+      profiles: { worker: profile, reviewer },
+    });
+    const enabled = orchestrator.submit(repo, "Enabled", { title: "Enabled", epics: [{ title: "E", tasks: [{ title: "T" }] }] }, { autoPrune: true });
+    const disabled = orchestrator.submit(repo, "Disabled", { title: "Disabled", epics: [{ title: "E", tasks: [{ title: "T" }] }] });
+    assert.equal(enabled.autoPrune, true);
+    assert.equal(disabled.autoPrune, false);
+    assert.equal(store.getAutoPrune(enabled.initiativeId), true);
+    assert.equal(store.getAutoPrune(disabled.initiativeId), false);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("external role selection wins over requested profile id", () => {
   const altWorker: ProfileManifest = { ...profile, id: "worker-alt" };
   const highWorker: ProfileManifest = { ...profile, id: "worker-high" };

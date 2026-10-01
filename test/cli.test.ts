@@ -31,6 +31,23 @@ function runCli(args: string[]): any {
   return JSON.parse(result.stdout);
 }
 
+test("resolves and persists per-submission automatic GC policy", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "loom-and-order-submit-policy-"));
+  const target = repo(dir);
+  const state = join(dir, "state");
+  const service = new ApplicationService({ stateDir: state, autoStart: false, env: { ...process.env, LAO_AUTO_PRUNE: "true" } });
+  try {
+    const plan = { title: "Policy", epics: [{ title: "Core", tasks: [{ title: "Task" }] }] };
+    const fromEnv = await service.submit(target, "env", plan);
+    const explicitOff = await service.submit(target, "off", { ...plan, title: "Off", epics: [{ title: "Core", tasks: [{ title: "Task 2" }] }] }, { autoPrune: false });
+    assert.equal(service.store.getAutoPrune(fromEnv.initiativeId), true);
+    assert.equal(service.store.getAutoPrune(explicitOff.initiativeId), false);
+  } finally {
+    service.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("builds an absolute detached runtime invocation with the state directory", () => {
   const invocation = detachedRunInvocation("/absolute/src/cli.ts", "initiative-test", "/tmp/loom-and-order-state");
   assert.equal(invocation.args[1], "/absolute/src/cli.ts");
