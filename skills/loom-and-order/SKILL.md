@@ -75,6 +75,8 @@ lao run <initiative-id>
 | `recover` | One-shot recovery sweep (stale sessions, expired/dead-owner leases) without a full run. |
 | `supervise [--follow]` | One supervisor cycle (default) or resident loop (`--follow`). |
 | `supervisor-status` | What the supervisor currently sees. |
+| `deliver <initiative-id>` | Non-destructive delivery of a **completed** initiative: builds a `loom-and-order/deliver-<initiative-id>` branch in the target repo with every completed epic merged in dependency order on top of the target's current HEAD, then runs the repo gate. The target working tree is never touched. Re-running rebuilds the branch. |
+| `prune [initiative-id] [--all] [--include-epics] [--dry-run]` | Remove worktrees of terminal task/subtask nodes. Merged task branches are deleted, unmerged ones are kept for forensics. `--include-epics` also removes completed epic worktrees (their branches are always kept — `deliver` needs them). |
 
 ### Inspection (read-only, safe anytime)
 | Command | What it shows |
@@ -175,15 +177,20 @@ Phase-specific notes:
 
 ## Delivery (bringing results home)
 
-Results live on **epic branches in the state-dir worktrees** — the runtime never touches your target checkout. To deliver:
+Results live on **epic branches in the state-dir worktrees** — the runtime never touches your target checkout. When the initiative is `completed`, deliver it with one command:
 
 ```bash
-STATE=/path/to/state-dir
-EW=$STATE/worktrees/<initiative-id>/<epic-id>
-git -C /path/to/target fetch $EW <epic-branch>   # or: git cherry-pick / merge
+lao deliver <initiative-id>
+# -> loom-and-order/deliver-<initiative-id> in the target repo, gate passed
 ```
 
-Every integrated commit passed: exactly-one-task-commit shape, reviewer pass, pre-merge gate, merge, post-merge epic gate. There is no `deliver` command in v1 — this manual step is intentional (the host owns the final integration boundary).
+The deliver branch merges every completed epic in dependency order on top of the target's current HEAD in a throwaway worktree; your working tree and its checked-out branch are never touched. You then review and merge the deliver branch yourself — the host owns the final integration boundary. Re-running `deliver` rebuilds the branch from scratch (idempotent). Every integrated commit already passed: exactly-one-task-commit shape, reviewer pass, pre-merge gate, merge, post-merge epic gate.
+
+After delivery, clean up disk:
+
+```bash
+lao prune <initiative-id> --include-epics
+```
 
 ## Trust modes
 
@@ -199,7 +206,7 @@ The runtime never installs into global npm/`~/.pi`, never copies host credential
 2. **`resume` costs one fresh attempt** (worker → reviewer → integration, ~10 min typical) — except when the prior-merge path makes integration a ~10 s no-op.
 3. **`maxAttempts` bounds only autonomous recovery.** Explicit `resume` intentionally bypasses it (a task can reach attempt 6 with maxAttempts 3).
 4. **One task = exactly one commit.** Decompose finely; a task that "needs" several logical commits will fail the shape check.
-5. **Worktrees are never garbage-collected in v1.** State dirs accumulate `worktrees/` per initiative; prune manually once an initiative is terminal and delivered.
+5. **Worktrees are not garbage-collected automatically.** Use `lao prune <initiative-id>` (add `--include-epics` for completed epics) once an initiative is terminal; `--dry-run` previews. Manual removal of state-dir worktrees is still possible for anything prune refuses.
 6. **Leases are PID-based** (`executor-<pid>`). Fine on a single host; do not run two hosts against one state dir (PID namespaces break the dead-owner probe).
 7. **`progress`/`tree`/`status` are read-only** — safe to poll aggressively. `message`/`plan-edit`/`resume`/`pause` are the only state writers besides `run`/`supervise`/`recover`.
 8. **The clean-checkout guard is real**: untracked garbage in the target repo (including stray directories) fails `submit` with "source checkout is not clean". Only runner-owned `.pi/quiet-tools/` artifacts are allowed.
@@ -209,7 +216,7 @@ The runtime never installs into global npm/`~/.pi`, never copies host credential
 ```bash
 lao doctor                                  # healthy: true
 lao progress <initiative-id>                # byStatus all completed
-git -C $EW log --oneline -5                      # merges present, no duplicates
-git -C $EW status --short                        # clean
-lao events --limit 10                       # last events are rollups
+git -C /path/to/target log --oneline -5 loom-and-order/deliver-<initiative-id>   # epic merges present, no duplicates
+git -C /path/to/target status --short                        # working tree untouched
+lao events --limit 10                       # last events are rollups / deliver_completed
 ```

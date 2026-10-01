@@ -117,6 +117,8 @@ node --experimental-strip-types src/cli.ts metrics <initiative-id> --prometheus 
 node --experimental-strip-types src/cli.ts feed <initiative-id> --follow
 node --experimental-strip-types src/cli.ts agents <initiative-id>
 node --experimental-strip-types src/cli.ts supervise --follow
+node --experimental-strip-types src/cli.ts deliver <initiative-id>
+node --experimental-strip-types src/cli.ts prune <initiative-id> --dry-run
 node --experimental-strip-types src/cli.ts profiles list
 node --experimental-strip-types src/cli.ts toolchain status
 node --experimental-strip-types src/cli.ts recover
@@ -172,8 +174,8 @@ Honest status after the crash/chaos dogfood. Verified live: full lifecycle, para
 Architectural debts to know before depending on v1:
 
 1. **Supervision is not a daemon.** The built-in supervisor lives only inside a `run` process; keep `lao supervise --follow` alive as a companion for unattended work, or crashes between runs stall up to the 90-min lease TTL.
-2. **No worktree GC.** State dirs accumulate `worktrees/` per initiative; prune manually after delivery.
-3. **No delivery command.** Results live on epic branches in the state-dir worktrees; merging them into your mainline is a deliberate manual host step (see [docs/operations.md](docs/operations.md#integration-and-delivery)).
+2. **No automatic worktree GC.** `lao prune` reclaims terminal worktrees and merged task branches after delivery; epic worktrees need `--include-epics`.
+3. **The host owns final integration.** `lao deliver` builds a gated `loom-and-order/deliver-<initiative-id>` branch in the target repo (working tree untouched); merging it into your mainline is a deliberate host step (see [docs/operations.md](docs/operations.md#integration-and-delivery)).
 4. **PID-based leases.** One host per state dir; PID namespaces (containers) break the dead-owner probe. The TTL is the backstop.
 5. **LLMs in the control plane.** Manager/Architect make recovery decisions (block/retry/escalate); bounded by attempt caps, but a bad decision ends in a manual intervention.
 6. **One task = exactly one commit.** Coarse task decomposition fails the commit-shape check; decompose finely.
@@ -182,4 +184,4 @@ Architectural debts to know before depending on v1:
 9. **SQLite single-writer.** Fine at dogfood load; `SQLITE_BUSY` may surface under much higher parallelism.
 10. **Schema migrations exist but were never exercised** by a real upgrade (v1 only).
 
-Deferred to v1.1: daemon supervision mode / `run --until-terminal`, worktree GC + `prune`, `deliver` command, sandboxed dogfood, reboot test, long-run test, subtask/release live coverage, TUI/MCP polish, cross-repo initiatives.
+Deferred to v1.1: daemon supervision mode / `run --until-terminal`, automatic worktree GC, sandboxed dogfood, reboot test, long-run test, release live coverage, TUI/MCP polish, cross-repo initiatives.

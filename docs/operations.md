@@ -107,11 +107,15 @@ Owners matter: supervisor-owned blockers clear on the next recovery cycle; manag
 
 ## Integration and delivery
 
-Each epic has its own branch and worktree; completed tasks merge into it (post-merge gated). The initiative's result is the set of epic branches. **The runtime never merges into your mainline and never pushes.** Delivery is a deliberate host-side step: fetch/cherry-pick/merge the epic branches into the target repository under your own control. This boundary is a feature: the runtime's safety guarantees end at the epic branch, and the final integration policy (rebase? squash? PR?) is yours.
+Each epic has its own branch and worktree; completed tasks merge into it (post-merge gated). **The runtime never merges into your mainline and never pushes.**
+
+When the initiative is `completed`, `lao deliver <initiative-id>` builds a `loom-and-order/deliver-<initiative-id>` branch in the target repository: every completed epic branch is merged, in dependency order, on top of the target's current HEAD, in a throwaway worktree, and the result must pass the repository gate. Your working tree and its checked-out branch are never touched, and re-running the command rebuilds the branch from scratch. You then review and merge the deliver branch yourself — the final integration policy (rebase? squash? PR?) is yours.
+
+`lao prune <initiative-id> [--all] [--include-epics] [--dry-run]` reclaims disk: worktrees of terminal task/subtask nodes are removed, merged task branches are deleted (unmerged ones are kept for forensics), and completed epic worktrees go only with `--include-epics`. Epic **branches** are always kept because `deliver` needs them.
 
 Consequences to plan for:
 
-- State dirs accumulate worktrees (no GC in v1); prune after delivery.
+- Prune terminal initiatives after delivery; `--dry-run` previews.
 - A delivered-and-deleted state dir loses the event history; archive `state.sqlite3` if you want the audit trail.
 
 ## Trust model
@@ -127,8 +131,8 @@ Nothing here promises LLM correctness or protection from a compromised host/kern
 | Limit | Impact | Mitigation |
 |---|---|---|
 | No daemon supervision | Crashes between `run`s stall up to 90 min (TTL) if no companion supervisor | keep `supervise --follow` alive for unattended work |
-| No worktree GC | Disk grows with initiatives | manual prune of terminal state dirs |
-| Manual delivery | No `deliver` command | fetch/merge epic branches (documented above) |
+| No automatic worktree GC | Disk grows with initiatives | `lao prune` after delivery (`--include-epics` for epics) |
+| Deliver branch is not merged for you | The host owns the final integration boundary | review and merge `loom-and-order/deliver-<initiative-id>` yourself |
 | PID-based leases | One host per state dir; PID reuse risk | TTL backstop; do not share state dirs across hosts |
 | Single-commit invariant | Coarse tasks fail shape checks | decompose finely (Architect guidance) |
 | `pi-sandbox` backend not dogfooded live | Sandbox path unverified in real runs | v1.1: sandboxed dogfood run |
