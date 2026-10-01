@@ -793,7 +793,7 @@ export class Store {
     }
   }
 
-  private gcEligibilityInternal(initiativeId: string, at: Date): GcEligibility {
+  private gcEligibilityInternal(initiativeId: string, at: Date, lockOwner?: string): GcEligibility {
     const initiative = this.getNode(initiativeId);
     if (!initiative || initiative.level !== "initiative") return { eligible: false, reason: "unknown_initiative" };
     if (!initiative.autoPrune) return { eligible: false, reason: "auto_prune_disabled" };
@@ -809,12 +809,12 @@ export class Store {
     const run = this.db.prepare("SELECT owner, pid FROM initiative_runs WHERE initiative_id = ? LIMIT 1").get(initiativeId) as any;
     if (run && this.processAlive(Number(run.pid))) return { eligible: false, reason: "active_initiative_run" };
     const lock = this.db.prepare("SELECT owner, pid FROM gc_locks WHERE initiative_id = ? LIMIT 1").get(initiativeId) as any;
-    if (lock && this.processAlive(Number(lock.pid))) return { eligible: false, reason: "gc_lock_conflict" };
+    if (lock && this.processAlive(Number(lock.pid)) && lock.owner !== lockOwner) return { eligible: false, reason: "gc_lock_conflict" };
     return { eligible: true, reason: null };
   }
 
-  checkGcEligibility(initiativeId: string, at = new Date()): GcEligibility {
-    return this.gcEligibilityInternal(initiativeId, at);
+  checkGcEligibility(initiativeId: string, at = new Date(), lockOwner?: string): GcEligibility {
+    return this.gcEligibilityInternal(initiativeId, at, lockOwner);
   }
 
   isGcEligible(initiativeId: string, at = new Date()): boolean {
@@ -828,7 +828,7 @@ export class Store {
    */
   acquireGcLock(initiativeId: string, owner: string, pid = process.pid): boolean {
     return this.tx(() => {
-      const eligibility = this.gcEligibilityInternal(initiativeId, new Date());
+      const eligibility = this.gcEligibilityInternal(initiativeId, new Date(), owner);
       if (!eligibility.eligible) return false;
       const existing = this.db.prepare("SELECT owner, pid FROM gc_locks WHERE initiative_id = ?").get(initiativeId) as any;
       if (existing) {
