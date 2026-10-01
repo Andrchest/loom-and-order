@@ -143,6 +143,20 @@ node --experimental-strip-types src/cli.ts run <initiative-id> --json
 
 Runtime state defaults to `~/.local/state/loom-and-order` and can be overridden with `LAO_STATE_DIR` or `--state-dir`. Results remain on task and epic branches until the host/release step merges them. Each task gets its own worktree and branch; cross-epic dependencies are materialized into the dependent epic base before the worker starts. The host validates a clean source checkout, exactly one task commit, reviewer pass, pre-merge gate, integration merge, and post-merge epic gate before completion. Runner-owned `.pi/quiet-tools` artifacts are allowed as untracked checkout noise; other user changes still fail closed. Architecture contracts distinguish path-only task outputs (`produces`) from prose outcomes (`deliverables`), pre-existing path inputs (`requiredArtifacts`), and textual/toolchain requirements (`prerequisites`); a task cannot require its own output. A semantic reviewer failure gets one automatic worker repair; after the second failure Manager decides whether to escalate to Architect, authorize an extra attempt, or block. Integration conflicts receive one bounded reset/retry and then remain explicitly blocked.
 
+### Automatic worktree GC (opt-in)
+
+Automatic GC is **off by default**. Opt in at submission with the CLI flag:
+
+```bash
+lao submit --repo /path/to/repo --prompt "Build ..." --auto-prune
+```
+
+or set `LAO_AUTO_PRUNE` to one of the explicit true values `true`, `1`, `yes`, or `on` (case-insensitive). Any other value, including unset, leaves it off. The resolved choice is persisted with the initiative, so detached `--no-start` submissions and later `run`/`resume` operations retain the operator's intent. MCP `submit` has the optional boolean `autoPrune`; omitted uses `LAO_AUTO_PRUNE`, while `false` explicitly disables it.
+
+When enabled, the runtime reuses the manual prune engine after each supervisor cycle (built-in or standalone) and after a runner releases its initiative lease. It considers a completed or blocked initiative only when every node is terminal (`completed`, `blocked`, or `failed`) and no node lease, running agent session, active initiative run, or competing GC lock remains. It removes eligible task/subtask worktrees and deletes a task/subtask branch only when Git proves that branch is an ancestor of its owning epic branch. Repeated sweeps are safe no-ops for already-cleared worktrees or absent branches. **Automatic GC never deletes epic worktrees or epic branches, and it retains every unmerged task/subtask branch.** It also never touches the target checkout or deliver branch.
+
+Automatic GC is best-effort: a Git/state failure is contained, recorded, and leaves the lifecycle status unchanged; a later sweep can retry. It is not a delivery step and does not merge or push anything. Inspect `events`/`feed`, `progress`, and `metrics` for sweep status, actions, skips, failures, and counters. If cleanup is incomplete, preview or retry the shared manual engine with `lao prune <initiative-id> --dry-run` and then `lao prune <initiative-id>`; use `--include-epics` only for deliberate manual cleanup of completed epic worktrees (epic branches remain for delivery). Durable policy, locks, events, metrics, and worktrees stay under the state directory, outside the target repository.
+
 See [profiles/README.md](profiles/README.md) for the example profiles, the model catalog, local/subscription pool selection, concurrency limits, bounded infrastructure retries, and the custom-profile workflow.
 
 See [docs/observability.md](docs/observability.md) for runtime metrics, wall-clock time, TTFT, generation time, TPS, per-type token counters, cost calculation, profile/model grouping, local MLflow traces/artifacts, TUI/MCP access, privacy boundaries, and the optional Prometheus text export.
@@ -173,8 +187,8 @@ Honest status after the crash/chaos dogfood. Verified live: full lifecycle, para
 
 Architectural debts to know before depending on v1:
 
-1. **Supervision is not a daemon.** The built-in supervisor lives only inside a `run` process; keep `lao supervise --follow` alive as a companion for unattended work, or crashes between runs stall up to the 90-min lease TTL.
-2. **No automatic worktree GC.** `lao prune` reclaims terminal worktrees and merged task branches after delivery; epic worktrees need `--include-epics`.
+1. **Supervision is not a daemon.** The built-in supervisor lives only inside a `run` process; keep `lao supervise --follow` alive as a companion for unattended work, or crashes between runs stall up to the 90-min lease TTL. Automatic GC runs at those runner/supervisor boundaries; it does not run continuously between them.
+2. **Automatic GC is conservative and opt-in.** It only cleans terminal task/subtask artifacts proven safe; Git failures, active leases/sessions, nonterminal nodes, and lock conflicts cause a skip or partial result. Use `lao prune` for explicit recovery; automatic GC never deletes epic worktrees or epic branches and retains unmerged task/subtask branches.
 3. **The host owns final integration.** `lao deliver` builds a gated `loom-and-order/deliver-<initiative-id>` branch in the target repo (working tree untouched); merging it into your mainline is a deliberate host step (see [docs/operations.md](docs/operations.md#integration-and-delivery)).
 4. **PID-based leases.** One host per state dir; PID namespaces (containers) break the dead-owner probe. The TTL is the backstop.
 5. **LLMs in the control plane.** Manager/Architect make recovery decisions (block/retry/escalate); bounded by attempt caps, but a bad decision ends in a manual intervention.
@@ -184,4 +198,4 @@ Architectural debts to know before depending on v1:
 9. **SQLite single-writer.** Fine at dogfood load; `SQLITE_BUSY` may surface under much higher parallelism.
 10. **Schema migrations exist but were never exercised** by a real upgrade (v1 only).
 
-Deferred to v1.1: daemon supervision mode / `run --until-terminal`, automatic worktree GC, sandboxed dogfood, reboot test, long-run test, release live coverage, TUI/MCP polish, cross-repo initiatives.
+Deferred to v1.1: daemon supervision mode / `run --until-terminal`, sandboxed dogfood, reboot test, long-run test, release live coverage, TUI/MCP polish, cross-repo initiatives.
